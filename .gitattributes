@@ -1,0 +1,13 @@
+# 仓库内一律存 LF；工作区检出时也不转换脚本与源码，
+# 否则 Windows 上 checkout 会把 scripts/fstate 变成 CRLF，
+# shebang 行带 \r 会报 "bad interpreter: No such file or directory"。
+* text=auto eol=lf
+
+# 必须逐字节保持 LF 的脚本
+scripts/fstate text eol=lf
+scripts/*.py text eol=lf
+*.sh text eol=lf
+*.js text eol=lf
+
+# 二进制
+*.tgz binary

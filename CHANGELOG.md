@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.0.5 — 2026-11-04
+
+这一版只修一件事，但是**会毁文件的**那种：`edit` / `write` 会给每个写过的文件盖上 UTF-8 BOM，并把 CRLF 压成 LF、把非 UTF-8 编码悄悄换成 UTF-8。所有功能测试都是绿的 —— 它坏的是**字节层**，而下一次读这个文件的工具（`JSON.parse`、`bash`、解释器）在别处炸掉。
+
+- **BOM 硬伤（根因）**：旧探测顺序是 `("utf-8-sig", "utf-8", "gbk", "latin-1")`。Python 的 `utf-8-sig` 对**没有** BOM 的纯 UTF-8 也能解码成功，所以 `enc` 恒为 `utf-8-sig`，写回时 `encode("utf-8-sig")` 就给文件插了 `EF BB BF`。后果：`package.json` → `SyntaxError: Unexpected token '﻿'`；`run.sh` → `` ./run.sh: line 1: ﻿#!/bin/bash: No such file or directory ``；`git diff` 第一行永远是「改过」。
+- **重写编码层**：新增 `BOM_TABLE`（UTF-32-LE/BE、UTF-8、UTF-16-LE/BE，长前缀优先）、`TextFile` 数据类（`text` / `encoding` / `bom` + `label` 形如 `utf-8 BOM CRLF`）、`load()`（**先认真 BOM，再谈回退**）、`write_back()`。`utf-8-sig` 不再参与探测。
+- **`write` 不再破坏原文件**：旧实现固定 `newline=""` + LF 正文，把 CRLF 文件整篇覆盖成 LF；编码逻辑与上面同源。现在规格优先级 `--encoding` > 原文件 > UTF-8+LF，正文按目标换行风格归一；写入后**自检重读**，字节层解读与写入内容不符就打 `⚠ 写回自检未通过`（这类错误静默通过的话，炸的是下一个读它的工具，且离现场很远）。
+- **`edit` 编码失败不再毁文件**：新内容无法用原编码（如往 GBK 文件塞 emoji）时抛 `UnicodeEncodeError`，现在捕获后打印 `ERROR: 新内容无法用原编码 gbk 编码` + 替代方案（`write --encoding utf-8`），**文件不动**，退出码 2。
+- **影子副本收敛**：三处内联 `write_text` 合并成 `save_shadow()`，并在 docstring 里写明「刻意统一 UTF-8+LF 存」的理由（`splitlines()` 已剥掉 `\r`，实测 CRLF 文件只改一行时 diff 仍只报那一行），失败原因记进 `meta["shadow_error"]`；顺带修了首次使用时缓存目录不存在导致的静默 `shadow=False`。
+- **回归**：6 类文件（无 BOM UTF-8 / UTF-8 BOM / CRLF / GBK 中文 / JSON / shell 脚本）`edit` 后逐字节比对全部保持原样；`write` 覆盖 CRLF/BOM/GBK 文件均保持原风格；`explore` / `digest` / `read` / `hot` / `state` 未受影响。
+
+**教训写进文档**：`utf-8-sig` 是「解码器」不是「探测器」—— 它对无 BOM 输入也成功，用它判断「有没有 BOM」永远得到「有」。
+
 ## 1.0.4 — 2026-11-03
 
 最后一轮（48 项正向边界 + 20 项恶意场景全部通过后）回头查「输出被截断时 reader 知不知情」，查出三处静默截断。它们都不会算错结果，但会让 Agent 得出「就这么多」的错误结论 —— 和 1.0.0 修的「digest 静默丢文件」是同一类毛病，只是触发条件分别为文件数上限、扫描上限、显示条数上限。

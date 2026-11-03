@@ -14,12 +14,14 @@
   reset    PATH             清缓存（外部改过文件、或怀疑状态不对时）
   hot      [--n N]          读得最多的文件排行（提醒自己别再重复读）
 
-编码：输出强制 UTF-8；源文件按 utf-8-sig → gbk → latin-1 依次尝试。
+编码：输出强制 UTF-8；源文件先认 BOM，再按 utf-8 → gbk → latin-1 依次尝试，
+      写回保持原 BOM / 原编码 / 原换行风格（BOM 只认真的 BOM，不拿 utf-8-sig 去试解码）。
 长短输出：超过 --max-chars 会自动落盘到 spill 文件，只回预览 + 路径。
 """
 from __future__ import annotations
 
 import argparse
+import codecs
 import difflib
 import math
 import hashlib
@@ -28,6 +30,7 @@ import os
 import re
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 # ---------------------------------------------------------------- 基础设施
@@ -148,19 +151,155 @@ def _save_meta(path: Path, meta: dict) -> None:
     _meta_path(path).write_text(json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8")
 
 
-def read_text(path: Path) -> tuple[str | None, str]:
-    """返回 (文本, 编码)；二进制或不可读返回 (None, '')。"""
+#: 认得出来的 BOM 及其对应解码器。**顺序有讲究**：UTF-32-LE 的 BOM 前两字节
+#: 与 UTF-16-LE 完全相同，长的必须排在前面先试。
+BOM_TABLE: tuple[tuple[bytes, str], ...] = (
+    (codecs.BOM_UTF32_LE, "utf-32-le"),
+    (codecs.BOM_UTF32_BE, "utf-32-be"),
+    (codecs.BOM_UTF8, "utf-8"),
+    (codecs.BOM_UTF16_LE, "utf-16-le"),
+    (codecs.BOM_UTF16_BE, "utf-16-be"),
+)
+
+#: 无 BOM 时的回退顺序。utf-8 严格解码在第一位：它失败才是「真不是 UTF-8」，
+#: 能成功就说明没有 BOM 也该按 utf-8 写字。
+FALLBACK_ENCODINGS = ("utf-8", "gbk", "latin-1")
+
+
+def _detect_newline(text: str) -> tuple[str, bool]:
+    """返回 (主换行风格, 是否混用)。
+
+    为什么要探测：写回时用 `newline=""` 拼回原文，换行风格完全由 text 自己决定。
+    只要 text 保持原样（我们只做字符串替换，不重排换行），编辑一处就只改动那一处，
+    不会把整篇 CRLF 冲成 LF —— 1.0.5 之前 write 覆盖整篇时正是栽在这里。
+    """
+    crlf = text.count("\r\n")
+    lf = text.count("\n") - crlf
+    cr = text.count("\r") - crlf
+    counts = [(crlf, "\r\n"), (lf, "\n"), (cr, "\r")]
+    top = max(counts, key=lambda x: (x[0], -len(x[1])))  # 同分时优先最短风格，避免把 LF 判成 CRLF
+    mixed = sum(1 for c, _ in counts if c > 0) > 1
+    return (top[1] if top[0] else ""), mixed
+
+
+@dataclass(frozen=True)
+class TextFile:
+    """一个已解码的文本文件，连同「怎么写回去才跟原来一样」的全部信息。
+
+    存在的理由：1.0.4 之前只记了 `enc` 一个字符串，于是三件事一起出错 ——
+      · 探测用 `utf-8-sig` 打头，它对**没有** BOM 的 UTF-8 也解码成功，
+        导致每个文件的 enc 都是 "utf-8-sig"，写回时无差别插一个 EF BB BF；
+      · 换行风格没有记录，`write` 整篇覆盖把 CRLF 冲成 LF；
+      · BOM 与编码混在一个字段里，没法表达「GBK 且无 BOM」这种组合。
+    现在三者分开存，写回一律走 `encode()`，字节层面与原文件对齐。
+    """
+
+    text: str        # 全文，BOM 已剥、换行原样保留
+    encoding: str    # 用于 str.encode 的 codec 名（不含 BOM 语义）
+    bom: bytes       # 文件开头真实的 BOM 字节；无 BOM 为 b""
+
+    @property
+    def newline(self) -> str:
+        return _detect_newline(self.text)[0]
+
+    @property
+    def mixed_newline(self) -> bool:
+        return _detect_newline(self.text)[1]
+
+    @property
+    def label(self) -> str:
+        """给人看的短标签，出现在 read/digest/write 的表头里。"""
+        parts = [self.encoding]
+        if self.bom:
+            parts.append("BOM")
+        nl, mixed = _detect_newline(self.text)
+        if nl == "\r\n":
+            parts.append("CRLF混用" if mixed else "CRLF")
+        elif nl == "\r":
+            parts.append("CR")
+        elif mixed:
+            parts.append("混用换行")
+        return " ".join(parts)
+
+    def encode(self, text: str) -> bytes:
+        """把文本按「原编码 + 原 BOM」编码成字节。"""
+        return self.bom + text.encode(self.encoding)
+
+
+def load(path: Path) -> tuple[TextFile | None, str]:
+    """读文件并判定编码/换行；不可读返回 (None, 原因)。
+
+    探测顺序：**先认真的 BOM**，没有 BOM 才谈回退。这是 1.0.5 的核心修复 ——
+    用 utf-8-sig 当探测器会把「无 BOM 的 UTF-8」谎报成「有 BOM」，写回就多出三个字节。
+    """
     if path.stat().st_size > 8 * 1024 * 1024:
         return None, "toolarge"
     raw = path.read_bytes()
-    if b"\x00" in raw[:8192]:
-        return None, "binary"
-    for enc in ("utf-8-sig", "utf-8", "gbk", "latin-1"):
+
+    bom, codec = b"", ""
+    for marker, name in BOM_TABLE:
+        if raw.startswith(marker):
+            bom, codec = marker, name
+            break
+
+    if not bom:
+        # 只有「无 BOM」的文件才用 NUL 判二进制；UTF-16/32 正文里满是 NUL，
+        # 但它们已经被上面认领走了。
+        if b"\x00" in raw[:8192]:
+            return None, "binary"
+
+    body = raw[len(bom):]
+    if codec:
         try:
-            return raw.decode(enc), enc
+            text = body.decode(codec)
         except UnicodeDecodeError:
-            continue
-    return None, "unknown"
+            return None, f"binary({codec})"
+    else:
+        for name in FALLBACK_ENCODINGS:
+            try:
+                text, codec = body.decode(name), name
+                break
+            except UnicodeDecodeError:
+                continue
+        else:
+            return None, "unknown"
+
+    return TextFile(text=text, encoding=codec, bom=bom), ""
+
+
+def read_text(path: Path) -> tuple[str | None, str]:
+    """老接口：只要 (正文, 标签)。不关心怎么写回去的调用方（explore/digest）用它。"""
+    tf, err = load(path)
+    if tf is None:
+        return None, err
+    return tf.text, tf.label
+
+
+def write_back(path: Path, tf: TextFile, text: str) -> None:
+    """按原编码 + 原 BOM 写回。编码不了就抛 UnicodeEncodeError，绝不悄悄换编码。"""
+    path.write_bytes(tf.encode(text))
+
+
+def save_shadow(path: Path, lines: list[str]) -> bool:
+    """影子副本：只用于「外部改动后算 diff」，**刻意**统一成 UTF-8 + LF 存。
+
+    为什么不用原编码原换行：影子副本只被 `split_lines()` 读进来做行级比对，
+    Python 的 `splitlines()` 已经把 `\\r\\n` / `\\r` / `\\n` 都当成分隔符剥掉了，
+    所以「CRLF 文件存成 LF 影子」不会让 diff 多出一行差异 —— 实测 CRLF 文件只改一行时
+    diff 仍只报那一行。反过来按原编码存要多记一份 BOM/编码状态，收益为零、状态多一份。
+
+    真正需要保真的是**被编辑的文件本身**，那走 `write_back()`，与这里无关。
+    """
+    try:
+        CACHE_HOME.mkdir(parents=True, exist_ok=True)
+        _shadow_path(path).write_text("\n".join(lines), encoding="utf-8")
+        return True
+    except Exception as exc:
+        _LAST_SHADOW_ERROR = f"{type(exc).__name__}: {exc}"
+        return False
+
+
+_LAST_SHADOW_ERROR = ""
 
 
 def sha1_of(path: Path) -> str:
@@ -243,10 +382,11 @@ def cmd_read(args: argparse.Namespace) -> int:
         return 2
     meta = _load_meta(path)
     disk = sha1_of(path)
-    text, enc = read_text(path)
-    if text is None:
-        print(f"ERROR: 无法按文本读取（{enc}）: {path}")
+    tf, why = load(path)
+    if tf is None:
+        print(f"ERROR: 无法按文本读取（{why}）: {path}")
         return 2
+    text, enc = tf.text, tf.label
     lines = split_lines(text)
     total = len(lines)
     rel = args.label or path.name
@@ -362,15 +502,12 @@ def _bump(path: Path, meta: dict, disk: str, lines: list[str], enc: str,
     })
     if path.stat().st_size <= SHADOW_LIMIT and mode in ("full", "changed", "cached"):
         if not meta.get("shadow") or mode in ("full", "changed"):
-            try:
-                # 缓存目录在首次使用时还不存在；不建目录就直接写会抛异常，
-                # 而下面的 except 会把它吞成 shadow=False，导致下次外部修改拿不到 diff。
-                CACHE_HOME.mkdir(parents=True, exist_ok=True)
-                _shadow_path(path).write_text("\n".join(lines), encoding="utf-8")
+            if save_shadow(path, lines):
                 meta["shadow"] = True
-            except Exception as exc:  # 真失败了要知道，别静默降级
+                meta.pop("shadow_error", None)
+            else:  # 真失败了要知道，别静默降级
                 meta["shadow"] = False
-                meta["shadow_error"] = f"{type(exc).__name__}: {exc}"
+                meta["shadow_error"] = _LAST_SHADOW_ERROR
     if diff:
         meta["last_diff"] = diff[:200_000]
     _save_meta(path, meta)
@@ -386,12 +523,13 @@ def cmd_edit(args: argparse.Namespace) -> int:
     if not path.is_file():
         print(f"ERROR: 文件不存在: {path}")
         return 2
-    text, enc = read_text(path)
-    if text is None:
-        print(f"ERROR: 无法按文本编辑（{enc}）")
+    tf, why = load(path)
+    if tf is None:
+        print(f"ERROR: 无法按文本编辑（{why}）: {path}")
         return 2
-    old = Path(args.old_file).read_text(encoding="utf-8") if args.old_file else args.old
-    new = Path(args.new_file).read_text(encoding="utf-8") if args.new_file else (args.new or "")
+    text, enc = tf.text, tf.label
+    old = Path(args.old_file).read_text(encoding="utf-8-sig") if args.old_file else args.old
+    new = Path(args.new_file).read_text(encoding="utf-8-sig") if args.new_file else (args.new or "")
     if not old:
         print("ERROR: 需要 --old/--old-file")
         return 2
@@ -423,7 +561,14 @@ def cmd_edit(args: argparse.Namespace) -> int:
     old_lines = split_lines(text)
     new_text = text.replace(old, new) if args.all else text.replace(old, new, 1)
     new_lines = split_lines(new_text)
-    path.write_text(new_text, encoding=enc if enc != "utf-8-sig" else "utf-8-sig", newline="")
+    try:
+        write_back(path, tf, new_text)
+    except UnicodeEncodeError as exc:
+        # GBK 文件里写进一个它编不了的字符（emoji、生僻字）—— 明确报错，
+        # 而不是让它 half-write 或悄悄改成 UTF-8 把后面所有工具都搞坏。
+        print(f"ERROR: 新内容无法用原编码 {tf.encoding} 编码：{exc}")
+        print(f"  文件没被改动。要改用别的编码请用: fstate.py write {path} --encoding utf-8 ...")
+        return 2
     diff = unified(old_lines, new_lines, args.label or path.name)
     rng = changed_lines_range(old_lines, new_lines) or hunks_new_range(diff)
 
@@ -437,11 +582,9 @@ def cmd_edit(args: argparse.Namespace) -> int:
         "last_diff": diff[:200_000], "reason": args.reason or "",
     })
     if path.stat().st_size <= SHADOW_LIMIT:
-        try:
-            _shadow_path(path).write_text("\n".join(new_lines), encoding="utf-8")
-            meta["shadow"] = True
-        except Exception:
-            meta["shadow"] = False
+        meta["shadow"] = save_shadow(path, new_lines)
+        if not meta["shadow"]:
+            meta["shadow_error"] = _LAST_SHADOW_ERROR
     _save_meta(path, meta)
 
     print(f"# 已改 {path}  → v{meta['version']}  {len(new_lines)} 行"
@@ -457,32 +600,68 @@ def cmd_edit(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------- write
 
 def cmd_write(args: argparse.Namespace) -> int:
-    """新建/整体覆盖：老内容存在就给 diff，不存在就只报行数与前几行。"""
+    """新建/整体覆盖：老内容存在就给 diff，不存在就只报行数与前几行。
+
+    写回规格（编码 / BOM / 换行）优先级：`--encoding` > 原文件 > UTF-8 + LF。
+    1.0.4 之前这一步恒定 `newline=""` + 探测出来的 "utf-8-sig"，于是
+    覆盖 CRLF 文件会把整篇冲成 LF，覆盖无 BOM 文件会凭空长出一个 BOM。
+    """
     path = resolve_input(args.path)
     if path.is_dir():
         print(f"ERROR: 这是目录不是文件: {path}")
         return 2
     if args.content_file:
-        body = Path(args.content_file).read_text(encoding="utf-8")
+        # 内容文件本身可能带 BOM（Windows 编辑器很爱加），utf-8-sig 会顺手剥掉
+        body = Path(args.content_file).read_text(encoding="utf-8-sig")
     elif args.stdin:
         body = sys.stdin.read()
     else:
         print("ERROR: 需要 --content-file 或 --stdin")
         return 2
-    if not body.endswith("\n"):
-        body += "\n"
 
-    enc = args.encoding or "utf-8"
     old_lines: list[str] = []
     existed = path.is_file()
+    original: TextFile | None = None
     if existed:
-        old_text, old_enc = read_text(path)
-        if old_text is not None:
-            old_lines = split_lines(old_text)
-            if not args.encoding:
-                enc = "utf-8-sig" if old_enc == "utf-8-sig" else old_enc
+        original, why = load(path)
+        if original is not None:
+            old_lines = split_lines(original.text)
+        else:
+            print(f"# ⚠ 原文件无法按文本读取（{why}），将按新文件写")
+
+    if args.encoding:
+        codec = "utf-8" if args.encoding in ("utf-8-sig", "utf8") else args.encoding
+        bom = codecs.BOM_UTF8 if args.encoding == "utf-8-sig" else b""
+        nl = original.newline if original else ""
+    elif original is not None:
+        codec, bom, nl = original.encoding, original.bom, original.newline
+    else:
+        codec, bom, nl = "utf-8", b"", ""
+
+    # 整篇覆盖是新内容，按目标文件风格统一换行；这是「保持原样」而不是「迁就调用方」。
+    if nl:
+        target_nl = "\r\n" if nl == "\r\n" else ("\r" if nl == "\r" else "\n")
+        body = body.replace("\r\n", "\n").replace("\r", "\n").replace("\n", target_nl)
+    else:
+        target_nl = "\n"
+    if body and not body.endswith(("\n", "\r")):
+        body += target_nl
+
+    enc = codec + (" BOM" if bom else "") + (" CRLF" if target_nl == "\r\n" else "")
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(body, encoding=enc, newline="")
+    try:
+        path.write_bytes(bom + body.encode(codec))
+    except UnicodeEncodeError as exc:
+        print(f"ERROR: 内容无法用 {codec} 编码：{exc}")
+        print("  文件没被改动。换编码请加 --encoding utf-8")
+        return 2
+
+    # 写完自检：重新读回来必须与写进去的一模一样，否则说明编码规格选错了 ——
+    # 这类错误静默通过的话，下一个读它的工具（JSON.parse、解释器）才会炸，且离现场很远。
+    check, why2 = load(path)
+    if check is None or check.text != body:
+        print(f"# ⚠ 写回自检未通过（{why2 or '内容不一致'}）：文件的字节层解读与写入内容不符")
+        print(f"#   建议改编码: fstate.py write {path} --encoding utf-8 --content-file ...")
 
     new_lines = split_lines(body)
     meta = _load_meta(path)
@@ -496,11 +675,9 @@ def cmd_write(args: argparse.Namespace) -> int:
         "last_diff": diff[:200_000], "reason": args.reason or "",
     })
     if path.stat().st_size <= SHADOW_LIMIT:
-        try:
-            _shadow_path(path).write_text("\n".join(new_lines), encoding="utf-8")
-            meta["shadow"] = True
-        except Exception:
-            meta["shadow"] = False
+        meta["shadow"] = save_shadow(path, new_lines)
+        if not meta["shadow"]:
+            meta["shadow_error"] = _LAST_SHADOW_ERROR
     _save_meta(path, meta)
 
     head = "已改" if existed else "已新建"

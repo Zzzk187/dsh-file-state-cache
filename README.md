@@ -22,10 +22,10 @@ The state lives **on disk**, not in the agent's context. That is the whole trick
 ## Install
 
 ```bash
-dsh plugin add dsh-file-state-cache
+dsh plugin --profile web add Zzzk187/dsh-file-state-cache
 ```
 
-Or from a checkout / local path:
+Or from a local checkout:
 
 ```bash
 dsh plugin --profile web add /path/to/dsh-file-state-cache

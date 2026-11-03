@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# fstate — cross-platform launcher for fstate.py
+#
+# Usage:  ./fstate read src/app.py --mode range --start 10 --end 40
+#
+# Picks a Python 3.8+ interpreter, in this order:
+#   1. $FSTATE_PYTHON            (explicit override — always wins)
+#   2. python3 / python on PATH
+#   3. a few well-known Windows locations (the DSH bundled runtime, conda, py launcher)
+#
+# The script itself is pure standard library, so any CPython 3.8+ will do.
+set -u
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+TARGET="$HERE/fstate.py"
+
+if [ ! -f "$TARGET" ]; then
+  echo "ERROR: fstate.py not found next to this launcher ($TARGET)" >&2
+  exit 1
+fi
+
+try_py() {
+  # $1 = candidate command/path. Prints nothing; exits 0 on success.
+  [ -z "${1:-}" ] && return 1
+  if [ -x "$1" ] || command -v "$1" >/dev/null 2>&1; then
+    if "$1" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3,8) else 1)' >/dev/null 2>&1; then
+      PY="$1"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+PY=""
+try_py "${FSTATE_PYTHON:-}" && :
+if [ -z "$PY" ]; then
+  for c in python3 python; do
+    try_py "$c" && break
+  done
+fi
+if [ -z "$PY" ]; then
+  # Windows: DSH bundles its own Python runtime; conda and the py launcher are common too.
+  for c in \
+    "$HOME/.dsh/dsh-runtimes/dsh-primary-runtime/dependencies/python/python.exe" \
+    "/c/Users/$USER/.dsh/dsh-runtimes/dsh-primary-runtime/dependencies/python/python.exe" \
+    "python.exe" \
+    "py"; do
+    try_py "$c" && break
+  done
+fi
+
+if [ -z "$PY" ]; then
+  echo "ERROR: no Python 3.8+ found." >&2
+  echo "  Set FSTATE_PYTHON to a python executable, e.g.:" >&2
+  echo "    export FSTATE_PYTHON=/usr/bin/python3" >&2
+  exit 127
+fi
+
+exec "$PY" "$TARGET" "$@"

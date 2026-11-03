@@ -1,0 +1,56 @@
+{
+  "name": "dsh-file-state-cache",
+  "version": "1.0.0",
+  "description": "File-state cache skill for DeepSeek Harness: one exploration call instead of ls+grep+read, reads that remember they already happened, and edits that return a diff instead of forcing a full re-read. State lives on disk, so it survives across tool calls, turns and restarts — a plain tool cannot do that.",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "dsh-skill",
+    "cordis",
+    "skill",
+    "context",
+    "tokens",
+    "file-cache",
+    "diff",
+    "coding-agent"
+  ],
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./package.json": "./package.json"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "files": [
+    "lib",
+    "scripts",
+    "SKILL.md",
+    "README.md",
+    "README.zh-CN.md",
+    "CHANGELOG.md",
+    "cordis.patch.yml",
+    "LICENSE"
+  ],
+  "license": "MIT",
+  "author": "xing",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Zzzk187/dsh-file-state-cache.git"
+  },
+  "homepage": "https://github.com/Zzzk187/dsh-file-state-cache#readme",
+  "bugs": {
+    "url": "https://github.com/Zzzk187/dsh-file-state-cache/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  }
+}

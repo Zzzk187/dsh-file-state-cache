@@ -22,7 +22,7 @@
 ## 安装
 
 ```bash
-dsh plugin add dsh-file-state-cache
+dsh plugin --profile web add Zzzk187/dsh-file-state-cache
 ```
 
 本地路径 / 开发时：

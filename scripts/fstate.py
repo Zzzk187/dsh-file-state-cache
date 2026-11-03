@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """fstate.py — 文件状态缓存 CLI（省上下文用）。
 
 核心思路：DSH 的单次读取工具没有记忆，同一个文件在两次 bash 之间被反复整篇读。

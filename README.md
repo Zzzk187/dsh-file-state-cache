@@ -111,7 +111,7 @@ That diff *is* the verification. The changed range (`14..14`) comes from `Sequen
 - **Shadow copies.** Files up to 2 MB get a `.shadow` copy so a later diff needs no git. Every state file is `<sha1(path)[:20]>.json` under `~/.dsh/fstate-cache/`.
 - **Encoding.** Source files are tried as `utf-8-sig` → `utf-8` → `gbk` → `latin-1`, and written back in the encoding they came in. Everything over 8 MB, or containing a NUL byte, is refused as "not text" instead of being mangled.
 - **Newlines are tolerant.** An LF fragment applied to a CRLF file matches; the file keeps its CRLF style on write-back.
-- **Bounded output.** Long diffs and logs spill to a file and you get a preview plus the path — output never blows up the context window.
+- **Bounded output — and it always says what it cut.** Long diffs and logs spill to a file and you get a preview plus the path, so output never blows up the context window. Whenever a cap fires (`--max-files`, `--max-scan`, `hot --n`, `--max-sigs`), a line like `remaining N` or `scanned the first N files and stopped (-max-scan)` is printed. Don't skim past that line: the answer may be in the part that got cut. Silent truncation never errors and never computes anything wrong — it just makes you believe "that's all there is", which is exactly the failure mode this tool exists to prevent.
 - **Cache location is yours.** `FSTATE_HOME` moves it. `reset <path>` drops one file; `hot` shows what's accumulating.
 
 ## When NOT to use it

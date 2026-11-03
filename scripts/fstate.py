@@ -524,10 +524,11 @@ def cmd_digest(args: argparse.Namespace) -> int:
     targets: list[Path] = []
     skipped: list[Path] = []
     all_ext = bool(getattr(args, "all_ext", False))
+    scan_info: dict = {}
     for raw in args.paths:
         p = resolve_input(raw)
         if p.is_dir():
-            for f in iter_files(p, args.max_scan):
+            for f in iter_files(p, args.max_scan, scan_info):
                 if all_ext or f.suffix.lower() in DIGEST_EXT or not DIGEST_EXT:
                     targets.append(f)
                 else:
@@ -541,12 +542,22 @@ def cmd_digest(args: argparse.Namespace) -> int:
         if k not in seen:
             seen.add(k)
             uniq.append(t)
+    total_avail = len(uniq)
+    # 截断必须说出来：否则「20 个文件」会被读成「目录里就 20 个」，
+    # 与之前修的「静默跳过非源码后缀」是同一类 bug，只是触发条件不同。
     uniq = uniq[: args.max_files]
+    rest = total_avail - len(uniq)
     if not uniq:
         print("ERROR: 没有可摘要的文件（目录里没有常见源码后缀？可用 --max-files 放宽）")
         return 2
 
-    print(f"# 结构摘要  {len(uniq)} 个文件")
+    if rest > 0:
+        print(f"# 结构摘要  {total_avail} 个文件中的前 {len(uniq)} 个"
+              f"（其余 {rest} 个看 --max-files，当前 {args.max_files}）")
+    else:
+        print(f"# 结构摘要  {len(uniq)} 个文件")
+    if scan_info.get("capped"):
+        print(f"# ⚠ 只扫描了前 {args.max_scan} 个文件（--max-scan），目录里还有没看的")
     if skipped:
         names = "、".join(x.name for x in skipped[:6])
         more = f" 等 {len(skipped)} 个" if len(skipped) > 6 else ""
@@ -645,16 +656,23 @@ def cmd_hot(args: argparse.Namespace) -> int:
                 continue
             rows.append((m.get("read_count", 0), m.get("path", "?"), m.get("lines", 0)))
     rows.sort(reverse=True)
+    if not rows:
+        print("缓存里还没有记录（还没用 fstate read 过任何文件）")
+        return 0
     print("读次数  行数   文件")
     for c, p, n in rows[: args.n]:
         flag = "  ← 反复读，考虑改用 range/diff" if c >= 5 else ""
         print(f"{c:6d}  {n:5d}   {p}{flag}")
+    if len(rows) > args.n:
+        print(f"（共 {len(rows)} 个文件有缓存记录，只显示前 {args.n} 个；看全部加 --n {len(rows)}）")
     return 0
 
 
 # ---------------------------------------------------------------- explore
 
-def iter_files(root: Path, max_files_scan: int):
+def iter_files(root: Path, max_files_scan: int, info: dict | None = None):
+    """遍历可读源码文件。info 非 None 时，若因 max_files_scan 提前收手会置 capped=True——
+    调用方必须把这件事说出来，否则「扫描 30 个」会被读成「目录里只有 30 个」。"""
     seen = 0
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")]
@@ -669,6 +687,8 @@ def iter_files(root: Path, max_files_scan: int):
                 continue
             seen += 1
             if seen > max_files_scan:
+                if info is not None:
+                    info["capped"] = True
                 return
             yield p
 
@@ -695,7 +715,8 @@ def cmd_explore(args: argparse.Namespace) -> int:
     dir_count: dict[str, int] = {}
     scanned = 0
     skipped_bundle = 0
-    for p in iter_files(root, args.max_scan):
+    scan_info: dict = {}
+    for p in iter_files(root, args.max_scan, scan_info):
         scanned += 1
         rel = str(p.relative_to(root)).replace("\\", "/")
         ext_count[p.suffix.lower() or "(none)"] = ext_count.get(p.suffix.lower() or "(none)", 0) + 1
@@ -780,6 +801,8 @@ def cmd_explore(args: argparse.Namespace) -> int:
     print(f"# 探索  query={q!r}  root={root}")
     print(f"扫描 {scanned} 个文件 -> 命中 {len(hits)} 个，显示 {len(top)} 个"
           + (f"（其余 {len(hits)-len(top)} 个看 --max-files）" if len(hits) > len(top) else ""))
+    if scan_info.get("capped"):
+        print(f"  ⚠ 扫描在 {args.max_scan} 个文件处截断（--max-scan），更深的没看。没找到就调大它。")
     # 概览压成两行：目录/后缀只在「一眼看结构」时有用，不值得占几十行。
     # 已有唯一强定义时（答案没悬念）这两行纯属噪音。
     if not strong:

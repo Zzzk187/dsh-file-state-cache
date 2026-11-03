@@ -12,12 +12,14 @@
 
 | Waste | Before | With this skill |
 |---|---|---|
-| **Exploration round-trips** | `ls`, then `grep`, then a blind `read` — three turns | one `explore "keyword"` → directory overview + hit lines + signatures + snippets + the next command to run |
+| **Exploration round-trips** | `ls`, then `grep`, then a blind `read` — three turns | one `explore "keyword"` → ranked hit files (with the **definition line number**) + hit lines + signatures + snippets + the next command to run, ~1.5 KB |
 | **Re-reading unchanged files** | full file again, every time | one line: *"unchanged, read N times before, last range …"* |
 | **Verifying an edit** | re-read the whole file | the unified diff + the **exact** changed line range |
 | **Reading N files to understand a structure** | N reads | one `digest` → N signatures in one screen |
 
 The state lives **on disk**, not in the agent's context. That is the whole trick: it survives across tool calls, turns, and restarts. A plain tool invocation cannot do that, which is why this is a CLI plus a skill rather than a set of registered tools.
+
+**Measured** on a 115-file TypeScript project over 538 real queries: `explore` averages 1.4 KB, puts the answer file first 93.6% of the time and in the top three 100% of the time. Touching the same file 4 times in a session saves 65%; editing N places with one confirmation each saves a steady 88%. But for a **one-shot task where you read a file once**, it loses — see [when not to use it](#when-not-to-use-it).
 
 ---
 
@@ -117,6 +119,10 @@ That diff *is* the verification. The changed range (`14..14`) comes from `Sequen
 - You already know the exact line numbers → a native read tool is faster; caching is overhead.
 - One-shot scripts, single commands → nothing happens twice, so a cache earns nothing.
 - Binary, images, or files over 8 MB → it refuses them by design.
+
+To be honest about it: **for a single-pass flow ("locate the problem → read a chunk → edit one place → confirm"), this skill actually costs more** — measured 11276 → 13140 B·turn (16.5% worse), because `explore` is ~18× more expensive than a precise `grep`, and `read` adds a line-number prefix that bare `sed` doesn't. That prefix is deliberate (the agent needs it to name an exact edit range), so it is not being trimmed for byte count.
+
+It pays off when **the same content gets reused** across the session: touching a file 4 times saves 65%, editing N places with one confirmation each saves 88%, and understanding 20 files at once saves 80%.
 
 **Rule of thumb: will this happen a second time? Yes → use it. No → use the native tool.**
 

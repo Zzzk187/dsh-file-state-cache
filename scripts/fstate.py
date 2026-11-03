@@ -70,6 +70,16 @@ SIG_RE = re.compile(
     re.M,
 )
 
+# 「定义」形态：比普通调用更能指向答案所在。
+# 只数出现次数会让 tests/ 里调用 19 次的文件压过 src/ 里只出现 5 次的真正定义处。
+DEF_RE = re.compile(
+    r"^\s*(?:export\s+)?(?:default\s+)?(?:public\s+|private\s+|protected\s+)?(?:async\s+)?"
+    r"(?:def|class|function|interface|type|struct|enum|trait|fn|func)\s+{name}\b"
+    r"|^\s*(?:export\s+)?(?:const|let|var)\s+{name}\s*[:=]"
+    r"|^\s*@(?:app\.)?(?:route|get|post|put|delete)\b",
+    re.M,
+)
+
 CACHE_HOME = Path(os.environ.get("FSTATE_HOME") or (Path.home() / ".dsh" / "fstate-cache"))
 SHADOW_LIMIT = 2 * 1024 * 1024   # 只给 ≤2MB 的文件存影子副本，用于 diff
 SKIP_SCAN_LIMIT = 2 * 1024 * 1024
@@ -77,6 +87,42 @@ SKIP_SCAN_LIMIT = 2 * 1024 * 1024
 
 def _key(path: Path) -> str:
     return hashlib.sha1(str(path.resolve()).lower().encode("utf-8")).hexdigest()[:20]
+
+
+def def_boost(low: str, terms: list[str]) -> int:
+    """这个词元在本文件里是「定义」形态吗？是则给一个大加分。
+
+    动机（实测）：查 createWorkBuddyAdapter 时，tests/adapter.spec.ts 里调用 6 次、
+    src/adapter.ts 里只在定义行出现 2 次 —— 只按出现次数排，答案被排到第 8 位，
+    Agent 得先读几个测试文件才发现找错了。定义形态只出现在答案文件里。
+    """
+    got = 0
+    for t in terms:
+        if len(t) < 3:
+            continue
+        try:
+            pat = DEF_RE.pattern.format(name=re.escape(t))
+        except (KeyError, IndexError):
+            continue
+        if re.search(pat, low, re.M):
+            got += 1
+    return got * 18
+
+
+def def_line(lines: list[str], terms: list[str]) -> int:
+    """在文件里找定义所在行号。下一步建议要指向它，而不是第一个命中行
+    ——命中行经常是注释或引用（`/** What {@link X} hands back. */`）。"""
+    for t in terms:
+        if len(t) < 3:
+            continue
+        try:
+            pat = re.compile(DEF_RE.pattern.format(name=re.escape(t)), re.M | re.I)
+        except (KeyError, IndexError):
+            continue
+        for i, ln in enumerate(lines, 1):
+            if pat.match(ln):
+                return i
+    return 0
 
 
 def _meta_path(path: Path) -> Path:
@@ -209,7 +255,10 @@ def cmd_read(args: argparse.Namespace) -> int:
 
     mode = args.mode
     if mode == "auto":
-        if not changed_vs_cache and meta.get("read_count", 0) > 0:
+        # 显式给了行范围就是想要局部正文，别拿「内容未变」把请求挡回去
+        if args.start is not None or args.end is not None:
+            mode = "range"
+        elif not changed_vs_cache and meta.get("read_count", 0) > 0:
             mode = "cached"
         elif changed_vs_cache:
             mode = "changed"
@@ -681,6 +730,8 @@ def cmd_explore(args: argparse.Namespace) -> int:
         # 只按内容出现计分，文件名命中不足以入选（否则 index.html 这类会压过真答案）
         if occ == 0:
             continue
+        # 定义优先：答案通常在定义处，而调用处往往更多
+        score += def_boost(low, terms)
         if score < args.min_score:
             continue
         # 命中行
@@ -700,53 +751,78 @@ def cmd_explore(args: argparse.Namespace) -> int:
                 sigs.append(f"{i:5d}| {ln.strip()[:140]}")
                 if len(sigs) >= args.max_sigs:
                     break
+        # 片段只给「命中行之外」的上下文；命中行上面已经列过了，重复一遍纯浪费
+        mset = {i for i, _ in matched}
         first = matched[0][0] if matched else 1
-        snip = "\n".join(
-            f"{i:5d}| {lines[i-1][:180]}" for i in range(first, min(len(lines), first + args.snippet_lines) + 1)
-        )
+        ctx: list[str] = []
+        for i in range(first, min(len(lines), first + args.snippet_lines * 3) + 1):
+            if i in mset:
+                continue
+            ctx.append(f"{i:5d}| {lines[i-1][:160]}")
+            if len(ctx) >= args.snippet_lines:
+                break
+        snip = "\n".join(ctx)
         # 长度惩罚：同样几次命中，短文件比长文件更有信息量（避免大文件靠体量霸榜）
         score = score / (1.0 + math.log10(max(1, len(lines)) / 60.0) if len(lines) > 60 else 1.0)
         hits.append({"rel": rel, "abs": str(p), "score": round(score, 1),
+                     "isdef": bool(def_boost(low, terms)),
+                     "defline": def_line(lines, terms),
                      "lines": [f"{i:5d}| {t}" for i, t in matched], "sigs": sigs, "snip": snip})
 
     hits.sort(key=lambda h: h["score"], reverse=True)
     top = hits[: args.max_files]
+    # 「唯一强定义」：全库只有一个文件带定义命中。此时答案已经没悬念，
+    # 概览/签名/完整其余列表都是噪音，压掉能省一半输出。
+    strong = bool(top) and bool(top[0].get("isdef")) and (
+        len(top) == 1 or top[0]["score"] >= top[1]["score"] * 1.25
+    )
 
     print(f"# 探索  query={q!r}  root={root}")
-    print(f"扫描 {scanned} 个文件，命中 {len(hits)} 个（按相关度降序，显示 {len(top)} 个）\n")
-    print("## 目录概览（文件数前 8）")
-    for d, c in sorted(dir_count.items(), key=lambda x: -x[1])[:8]:
-        print(f"  {d:<28} {c:5d} 文件")
-    print("## 主要后缀")
-    print("  " + "  ".join(f"{e}:{c}" for e, c in sorted(ext_count.items(), key=lambda x: -x[1])[:10]))
+    print(f"扫描 {scanned} 个文件 -> 命中 {len(hits)} 个，显示 {len(top)} 个"
+          + (f"（其余 {len(hits)-len(top)} 个看 --max-files）" if len(hits) > len(top) else ""))
+    # 概览压成两行：目录/后缀只在「一眼看结构」时有用，不值得占几十行。
+    # 已有唯一强定义时（答案没悬念）这两行纯属噪音。
+    if not strong:
+        dirs = " | ".join(f"{d} {c}" for d, c in sorted(dir_count.items(), key=lambda x: -x[1])[:6])
+        exts = " ".join(f"{e}:{c}" for e, c in sorted(ext_count.items(), key=lambda x: -x[1])[:8])
+        print(f"  目录: {dirs}")
+        print(f"  后缀: {exts}")
     print()
-    for h in top:
-        print(f"### {h['rel']}   score={h['score']}")
+    for idx, h in enumerate(top):
+        mark = "  \u2605\u5b9a\u4e49" if h.get("isdef") else ""
+        dl = f":{h['defline']}" if h.get("defline") else ""
+        print(f"### {h['rel']}{dl}  score={h['score']}{mark}")
         if h["lines"]:
-            print("  命中行:")
             for ln in h["lines"]:
-                print("   " + ln)
-        if h["sigs"]:
-            print("  签名:")
-            for s in h["sigs"]:
-                print("   " + s)
-        if h["snip"]:
-            print("  片段:")
-            for ln in h["snip"].splitlines():
-                print("   " + ln)
-        if h["lines"]:
+                print("  命中 " + ln.strip())
+        # 签名与片段只给第一个文件：第一名是答案的概率最高，其余给了也是噪音
+        if h["sigs"] and not strong and (idx == 0 or len(top) <= 2):
+            for s in h["sigs"][:3]:
+                print("  签名 " + s.strip())
+        if h["snip"] and idx == 0:
+            for ln in h["snip"].splitlines()[: args.snippet_lines]:
+                print("  片段 " + ln.strip())
+    # 被截断的文件只列路径：一行几十字节，换来「没有东西被藏起来」
+    rest = hits[len(top):]
+    if rest:
+        cap = 5 if strong else 10
+        names = ", ".join(h["rel"] for h in rest[:cap])
+        more = f" 等 {len(rest)} 个" if len(rest) > cap else ""
+        print()
+        print(f"其余: {names}{more}  （要详情加 --max-files）")
+    print()
+    if top:
+        h0 = top[0]
+        first = h0.get("defline") or 0
+        if not first:
             try:
-                first = int(h["lines"][0].split("|")[0])
+                first = int(h0["lines"][0].split("|")[0]) if h0["lines"] else 1
             except Exception:
                 first = 1
-            print(f"  下一步: fstate.py read \"{h['rel']}\" --mode range --start {max(1, first-5)} --end {first+40}")
-        print()
-    print("## 建议下一步")
-    if top:
-        print(f"  1) 想读局部: fstate.py read \"{top[0]['rel']}\" --mode range --start N --end M")
-        print(f"  2) 想改:    fstate.py edit \"{top[0]['rel']}\" --old ... --new ... （回 diff，不用重读全文）")
+        print(f"下一步: fstate.py read \"{h0['rel']}\" --mode range --start {max(1, first-5)} --end {first+40}")
+        print(f"        fstate.py edit \"{h0['rel']}\" --old ... --new ...   （回 diff，不必重读全文）")
     else:
-        print("  无命中。换个说法（更短的词）、或加大 --max-scan / 换 --root。")
+        print("无命中。换个说法（更短的词）、或加大 --max-scan / 换 --root。")
     return 0
 
 
@@ -760,10 +836,10 @@ def main() -> int:
     e = sub.add_parser("explore", help="一次成型探索")
     e.add_argument("query")
     e.add_argument("--root", default=".")
-    e.add_argument("--max-files", type=int, default=12)
-    e.add_argument("--max-hits", type=int, default=4)
+    e.add_argument("--max-files", type=int, default=3)
+    e.add_argument("--max-hits", type=int, default=3)
     e.add_argument("--max-sigs", type=int, default=6)
-    e.add_argument("--snippet-lines", type=int, default=6)
+    e.add_argument("--snippet-lines", type=int, default=4)
     e.add_argument("--max-scan", type=int, default=6000)
     e.add_argument("--min-score", type=float, default=3.0)
     e.add_argument("--max-chars", type=int, default=24000)

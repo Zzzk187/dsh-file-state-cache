@@ -1,5 +1,7 @@
 # dsh-file-state-cache
 
+**English** · [简体中文](README.zh-CN.md)
+
 > A DSH skill that makes file reading **stateful** — so the agent stops re-reading what it already read.
 
 `ls` → `grep` → `read` → `read again to confirm the edit`. Four round-trips, three of which are the agent asking itself *"didn't I already look at this?"*. This skill replaces that with one exploration call, reads that remember they happened, and edits that return a diff instead of demanding a full re-read.

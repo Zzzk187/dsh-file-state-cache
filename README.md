@@ -1,79 +1,82 @@
-# dsh-file-state-cache
+# dsh-file-state-cache · 文件状态缓存
 
-**English** · [简体中文](README.zh-CN.md)
+[English](README.en.md) · **简体中文**
 
-> A DSH skill that makes file reading **stateful** — so the agent stops re-reading what it already read.
+> 让 AI 记住「这个文件我读过」，别每次都从头读一遍。
 
-`ls` → `grep` → `read` → `read again to confirm the edit`. Four round-trips, three of which are the agent asking itself *"didn't I already look at this?"*. This skill replaces that with one exploration call, reads that remember they happened, and edits that return a diff instead of demanding a full re-read.
-
----
-
-## What it actually saves
-
-| Waste | Before | With this skill |
-|---|---|---|
-| **Exploration round-trips** | `ls`, then `grep`, then a blind `read` — three turns | one `explore "keyword"` → ranked hit files (with the **definition line number**) + hit lines + signatures + snippets + the next command to run, ~1.5 KB |
-| **Re-reading unchanged files** | full file again, every time | one line: *"unchanged, and this session already delivered the full body of v2"* |
-| **Verifying an edit** | re-read the whole file | the unified diff + the **exact** changed line range |
-| **Reading N files to understand a structure** | N reads | one `digest` → N signatures in one screen |
-
-The state lives **on disk**, not in the agent's context. That is the whole trick: it survives across tool calls, turns, and restarts. A plain tool invocation cannot do that, which is why this is a CLI plus a skill rather than a set of registered tools.
-
-But the **"this body was already delivered"** receipt is only valid **within the current session**. What survives across sessions is *"I have read this file, it is at version N, my last edit touched lines X..Y"* — not *"it is in your context right now"*. So after a session change or a context reset, `read` hands you the body again instead of dismissing you with "unchanged". That boundary is deliberate: a tool whose entire job is saving context must never manufacture the illusion of having seen something.
-
-**Measured** on a 115-file TypeScript project over 538 real queries: `explore` averages 1.4 KB, puts the answer file first 93.6% of the time and in the top three 100% of the time. Touching the same file 4 times in a session saves 65%; editing N places with one confirmation each saves a steady 88%. But for a **one-shot task where you read a file once**, it loses — see [when not to use it](#when-not-to-use-it).
+一个 DSH 插件兼技能。装好之后，Agent 读文件会变「有记忆」。
 
 ---
 
-## Install
+## 它解决什么
+
+Agent 干活时经常这样绕圈：
+
+```
+ls 看目录 → grep 找关键词 → read 打开文件 → 改完再 read 确认
+```
+
+四步里三步是重复劳动。装了它：
+
+| 以前 | 现在 |
+|---|---|
+| `ls` + `grep` + 盲目 `read`，三轮 | 一句 `explore "关键词"`，直接告诉你哪个文件、第几行是定义、下一步读哪段 |
+| 同一个文件每次都重读全文 | 第二次只回一行「内容未变」 |
+| 改完再读全文确认 | `edit` 直接回 diff + 改的是第几行 |
+| 读 10 个文件才看懂结构 | 一句 `digest`，一屏 10 个函数签名 |
+
+省下来的是**上下文（token）**，代价是硬盘上一点缓存。
+
+> **一句话判断**：这件事会发生第二遍吗？会 → 用它；不会 → 用系统自带的读文件工具。
+
+---
+
+## 安装
 
 ```bash
 dsh plugin --profile web add Zzzk187/dsh-file-state-cache
 ```
 
-Or from a local checkout:
-
-```bash
-dsh plugin --profile web add /path/to/dsh-file-state-cache
-```
-
-**Requirements:** Python 3.8+. Zero third-party packages — standard library only.
-
-The skill appears in your skill catalog as `file-state-cache`.
+- 需要 **Python 3.8+**，不用装任何第三方包（纯标准库）
+- 装完技能列表里会出现 `file-state-cache`
+- 本机开发时装本地目录：`dsh plugin --profile web add /你的路径/dsh-file-state-cache`
 
 ---
 
-## Use
-
-Once loaded, the skill tells the agent where its script lives. Manually:
+## 30 秒上手
 
 ```bash
-F="<package-root>/scripts/fstate"
-
-"$F" explore "handleRequest" --root .     # locate code: overview + hits + signatures
-"$F" read src/app.py                      # 1st time: full text. 2nd time: one line.
-"$F" read src/app.py --mode range --start 40 --end 90
-"$F" edit src/app.py --old 'return 1' --new 'return 2' --reason "fix the boundary"
-"$F" digest src/                          # structure of a whole directory at once
-"$F" state src/app.py                     # version, line count, read count, STALE?
-"$F" hot --n 10                           # which files am I re-reading too much?
+F="<包目录>/scripts/fstate"          # 技能会告诉你包在哪
 ```
 
-If the launcher can't find Python, pin it:
+`<包目录>` 就是装完后的插件目录，通常长这样：
+
+```
+~/.dsh/profiles/<profile>/node_modules/dsh-file-state-cache
+```
+
+（Windows 上是 `C:\Users\你\.dsh\profiles\<profile>\node_modules\dsh-file-state-cache`。不确定的话 `python "<包目录>/scripts/fstate.py" -h` 能跑通就说明对了。）
 
 ```bash
-export FSTATE_PYTHON=/usr/bin/python3
+"$F" explore "handleRequest" --root .   # 不知道代码在哪时先问它
+"$F" read src/app.py                    # 第一次给全文；第二次只给一行
+"$F" edit src/app.py --old 'return 1' --new 'return 2'
+"$F" digest src/                        # 一眼看完整目录结构
 ```
 
-### `read --mode auto` (the default) decides for you
+`read` 默认会自己判断该给你什么：
 
-| Disk state | What you get back |
+| 磁盘状态 | 返回 |
 |---|---|
-| never read | the full text (paginated if huge) |
-| read before, unchanged | **a single summary line** — no content |
-| read before, changed on disk | **only the diff** + exact changed line range |
+| 从没读过 | 正文 |
+| 读过、没变，且**本会话**已完整交付过正文 | 一行摘要（**不吐正文**） |
+| 读过、但被改过 | 只回 diff + 改动在第几行 |
 
-### Example: what an edit returns
+> 两个细节新手容易踩：
+> - **一次最多给 400 行**（大文件会被截断）。这时它会明说「已显示前 400/1000 行，**不算读过**」并给续读命令 —— 下次 `read` 会接着给，不会拿「内容未变」把你打发走。
+> - 摘要那行只在**本会话内**成立。换了会话或上下文被压缩过，它会重新给正文。这是故意的：「省上下文」不能变成「让你以为自己看过」。
+
+`edit` 的输出长这样，**这就是验证，不用再读一遍**：
 
 ```
 # 已改 src/app.py  → v2  19 行  区间 14..14
@@ -82,63 +85,121 @@ export FSTATE_PYTHON=/usr/bin/python3
 @@ -11,7 +11,7 @@
 -    return {"ok": True, "uptime": 0}
 +    return {"ok": True, "uptime": 42}
-[确认改动不必重读全文：看局部用 --mode range --start 14 --end 14]
 ```
 
-That diff *is* the verification. The changed range (`14..14`) comes from `SequenceMatcher`, not from the diff hunk header — so it excludes the three lines of context and points at the one line that actually moved.
+`区间 14..14` 指的是真正变动的那一行 —— 不包含 diff 里的 3 行上下文。
 
 ---
 
-## Subcommands
+## 命令一览
 
-| Command | What it does |
+| 命令 | 干什么 |
 |---|---|
-| `explore QUERY` | directory overview + ranked hit files + hit lines + signatures + snippets + next step |
-| `read PATH` | cached read: unchanged → summary, changed → diff, `--mode range` for a slice |
-| `edit PATH --old/--new` | edit and return a unified diff + exact changed line range |
-| `write PATH --content-file` | whole-file write (preview when new, diff when overwriting; a missing parent dir is an error unless you pass `--mkdir`) |
-| `digest PATH...` | structure of many files (line counts + signatures + cache state) |
-| `state PATH` | version / lines / read count / last edit range / STALE flag |
-| `diff PATH` | the last diff |
-| `reset PATH` | drop one file's cache |
-| `hot [--n N]` | files you have read the most — a self-check for re-reading habits |
+| `explore "关键词"` | 找代码：命中文件 + 定义行号 + 片段 + 下一步命令 |
+| `read 文件` | 带缓存的读：没变给摘要，变了给 diff |
+| `read 文件 --mode range --start 40 --end 90` | 只读某几行 |
+| `edit 文件 --old 旧 --new 新` | 改一处，回 diff + 精确行号 |
+| `write 文件 --content-file 内容文件` | 整篇写入 |
+| `digest 目录/` | 多个文件的结构总览 |
+| `state 文件` | 这个文件的缓存状态（版本、读过几次、是否过期） |
+| `diff 文件` | 看上次的完整 diff |
+| `reset 文件` | 清掉这个文件的缓存 |
+| `hot` | 我在反复读哪些文件（自查用） |
 
-`"$F" --help` lists everything.
+`--help` 看全部参数。
+
+**几个常用开关：**
+
+- `--mode full` / `range` / `changed`：显式指定读法，不让它自己判断
+- `--max-chars 20000`：输出上限，超了会截断，**但一定会告诉你截了**
+- `--label "配置解析"`：在输出里用这个名字代替长路径
+- `write --mkdir`：父目录不存在时替你建（默认会报错，防止路径打错还静默成功）
 
 ---
 
-## Design notes
+## 它是怎么记住的
 
-- **Disk is the source of truth.** Every read and edit compares SHA-1 first. Edit the file in your editor, `git checkout`, whatever — the next `read` notices and hands you a diff instead of stale content. `state` reports `STALE`.
-- **Shadow copies.** Files up to 2 MB get a `.shadow` copy so a later diff needs no git. Every state file is `<sha1(path)[:20]>.json` under `~/.dsh/fstate-cache/`.
-- **Encoding.** A real BOM (UTF-8 / UTF-16 / UTF-32, either endianness) decides the encoding up front; only when there is no BOM are the fallbacks `utf-8` → `gbk` → `latin-1` tried. Write-back preserves the original BOM, encoding and newline style — a file that had no BOM never gains one. Everything over 8 MB, or containing a NUL byte, is refused as "not text" instead of being mangled. `utf-8-sig` is deliberately *not* used as a probe: it happily decodes plain UTF-8, which is how earlier versions silently stamped `EF BB BF` onto every file they edited.
-- **Newlines are tolerant.** An LF fragment applied to a CRLF file matches; the file keeps its CRLF style on write-back. `write` normalizes the replacement body to the target file's newline style, so a whole-file overwrite cannot silently convert CRLF to LF either.
-- **No silent parameter surprises.** `edit` refuses to run without an explicit `--new` / `--new-file` (an omitted `--new` used to mean "replace with empty" and still print *edited*); deleting requires writing `--new ''` on purpose. Argument prefix abbreviations are disabled on the top-level parser *and* on all nine subparsers, because `--content hi` used to be read as `--content-file hi` and `--old abc` as "open the file named abc". Supplying identical `--old` and `--new` reports *no change* instead of bumping a version. Every failure path (missing `--old-file`, read-only target, unwritable file) prints one actionable sentence and leaves the file untouched, rather than dumping a traceback.
-- **Bounded output — and it always says what it cut.** Long diffs and logs spill to a file and you get a preview plus the path, so output never blows up the context window. Whenever a cap fires (`--max-files`, `--max-scan`, `hot --n`, `--max-sigs`), a line like `remaining N` or `scanned the first N files and stopped (-max-scan)` is printed. Don't skim past that line: the answer may be in the part that got cut. Silent truncation never errors and never computes anything wrong — it just makes you believe "that's all there is", which is exactly the failure mode this tool exists to prevent.
-- **A truncated read is not a read.** If `--max-lines` cuts the tail off, or a single enormous line is cut by `--max-chars`, the output says so and the cache records **no line range** for it — so the next `read` hands you the body again instead of answering "unchanged, already read 1 time" and skipping text that never reached the conversation. For the same reason `--start 0` is now rejected (lines start at 1) instead of being quietly clamped to line 1. Truncated diffs are announced too, and the `diff` subcommand can replay the full one (up to 200k chars).
-- **What didn't reach you is not "read".** That is the tool's one real promise: a read cut short by `--max-lines` / `--max-chars`, and a `--mode cached` read where the file changed on disk, record no line range and leave the old sha1 in place — so the next `read` hands you the body again instead of skipping it with "unchanged". `edit`'s diff is capped too (`--max-chars`, default 12000) and says so when it cuts, pointing at the `diff` subcommand.
-- **Cache location is yours.** `FSTATE_HOME` moves it. `reset <path>` drops one file; `hot` shows what's accumulating (including orphan shadows, and how much the spilled truncated bodies under `spill/` occupy — `reset` does not clean that directory, delete it by hand).
-- **What you didn't say, it doesn't decide.** Writing `abc` to a new file stores `abc`, not `abc\n` (it used to append a trailing newline with `rc=0` and no warning). Writing identical content again is not a "change" either — it compares the bytes on disk first, says `# no change`, keeps the version, and keeps the receipt; previously it bumped the version, so the next `read` handed you the whole body again — an idempotent call that ate your context.
-- **The read side has defenses too.** The receipt requires the *same session* (`DSH_SESSION_ID`). When no session id is available it falls back to the **conservative** answer and gives you the body, instead of treating two missing values as "equal" (which used to make it most permissive exactly when it was least sure). Cache entries are type-checked (`version: true` is rejected — `True == 1` could forge a receipt), but "the file got shorter" is not cache corruption: out-of-range spans are clamped to the current line count, and `state` reports both `read_ranges` (clamped) and `read_ranges_raw` (as recorded).
+**关键：状态存在硬盘上，不在上下文里。** 所以它能跨工具调用、跨轮次、跨重启活着。
 
-## When NOT to use it
+每个文件一条 JSON，存在 `~/.dsh/fstate-cache/`，外加一份「上次读到的原文」影子副本（≤2 MB 的文件才有），用来算 diff —— 不需要装 git。
 
-- You already know the exact line numbers → a native read tool is faster; caching is overhead.
-- One-shot scripts, single commands → nothing happens twice, so a cache earns nothing.
-- Binary, images, or files over 8 MB → it refuses them by design.
+```
+read(文件)
+  ├─ 先算当前磁盘上的 SHA-1
+  ├─ 没记录 ──────────→ 全文（首次）
+  ├─ SHA-1 没变 ──────→ 一行摘要（没变）
+  └─ SHA-1 变了 ──────→ 有影子？→ diff + 精确行号
+                       没影子？→ 老实说「我没有基线」，给全文
+```
 
-To be honest about it: **for a single-pass flow ("locate the problem → read a chunk → edit one place → confirm"), this skill actually costs more** — measured 11276 → 13140 B·turn (16.5% worse), because `explore` is ~18× more expensive than a precise `grep`, and `read` adds a line-number prefix that bare `sed` doesn't. That prefix is deliberate (the agent needs it to name an exact edit range), so it is not being trimmed for byte count.
+最后那条分支是重点：**它不会假装知道改了什么。**
 
-It pays off when **the same content gets reused** across the session: touching a file 4 times saves 65%, editing N places with one confirmation each saves 88%, and understanding 20 files at once saves 80%.
+> **一个刻意的限制**：「这份正文我给过了」这张凭证**只在本会话内有效**。换了会话、或上下文被压缩重置，`read` 会重新把正文给你，而不是用一句「内容未变」把你打发走。省上下文的工具，不能反过来制造「以为自己看过」的错觉。
 
-**Rule of thumb: will this happen a second time? Yes → use it. No → use the native tool.**
+---
 
-## Compatibility
+## 几个设计上的讲究
 
-Verified against DSH `0.2.1-rc.5`. The skill provider uses `ctx.skills.registerProvider` and degrades gracefully on hosts that don't pass a `control` object (SKILL.md edits then need a restart instead of hot-reloading).
+- **编码不会被改。** 有 BOM 就认 BOM（UTF-8/16/32 各种组合），没有才依次试 UTF-8 → GBK → Latin-1。写回保持原 BOM、原编码、原换行（CRLF 还是 CRLF）。本来没 BOM 的文件绝不会凭空多出一个 BOM —— 这一条是踩过坑的：早期版本用 `utf-8-sig` 去「探测」编码，而它对无 BOM 的文件也会成功，结果给每个改过的文件都盖了 BOM，让 `JSON.parse` 和 shell 脚本当场炸掉。
+- **参数不玩阴的。** `edit` 不给 `--new` 会直接报错停下，**不会**把「你没说」当成「删掉」（旧版会，还回一句「已改」）。要删就得显式写 `--new ''`。
+- **砍掉什么都告诉你。** 输出超限会截断，但一定补一行说清了砍掉多少、怎么接着看。看到 `⚠ 截断` 别忽略，答案可能就在被砍的那部分。
+- **没交出去的不算读过。** 被截断的读，缓存里不记这个范围 —— 下次 `read` 会老老实实再给一遍，而不是用「内容未变」把没进过上下文的正文跳过。这是整个工具唯一真正的承诺。
+- **缓存位置可搬。** `FSTATE_HOME` 换目录；`hot` 看谁占得多，`reset` 清单个。
 
-The skill registers at rank `600` (bundled). If you also keep a local copy under `~/.dsh/dsh-skill/file-state-cache`, the local one wins — a plugin should not override your own specialized version.
+---
 
-## License
+## 什么时候**别**用它
+
+- **已经知道确切行号** → 系统自带的读文件工具更快，进缓存是负担
+- **一次性的事**（单条命令、跑完就完的脚本）→ 没有第二遍，缓存不赚钱
+- **二进制 / 图片 / 超过 8 MB** → 它按设计拒绝
+
+说实话：**「定位问题 → 读一段 → 改一处 → 确认」这种只走一遍的流程，用它反而更贵**（实测多花 16.5%，因为 `explore` 比精确 grep 贵，`read` 还会加行号前缀）。
+
+它划算在**同一批内容被反复用到**：一个文件碰 4 次省 65%，改 N 处各确认一次省 88%，一次看懂 20 个文件省 80%。
+
+---
+
+## 常见问题
+
+**Q：会不会读到我改之前的旧内容？**
+不会。每次读之前都先算当前文件的 SHA-1 和记录比，不一致就按「被外部改过」处理，用影子副本算 diff。唯一可能退化的情况是影子副本丢了 —— 那时它会明说「降级为全文」。
+
+**Q：会不会和系统自带的读文件工具打架？**
+不会，它不改任何原生工具，只是多给你一个选择。分工是：**知道确切行号 → 用原生工具；要第二次碰同一个文件 → 用这个。**
+
+**Q：缓存脏了 / 想从头来？**
+
+```bash
+"$F" reset src/app.py         # 清一个
+rm -rf ~/.dsh/fstate-cache    # 全清，无害，下次自动重建
+```
+
+**Q：占多少硬盘？**
+每个文件约 300 字节 JSON + 一份影子副本（≤2 MB，且只有真读过的文件才有）。上千文件的项目通常几 MB 到几十 MB。介意的话 `hot` 看谁最大，`reset` 掉。
+
+---
+
+## 排错
+
+| 症状 | 原因 | 怎么办 |
+|---|---|---|
+| `ERROR: 找不到 python` | 外壳脚本没找到 Python | `export FSTATE_PYTHON=/路径/python3` |
+| `ERROR: 未找到 old 片段` | `--old` 和文件内容对不上（空格/缩进） | 用 `read --mode range` 把那几行**原样复制**出来当 `--old`；换行符不用管，它会自动适配 |
+| `old 片段出现 N 次，不唯一` | 片段太短，匹配到多处 | 多带一行上下文；确实要全改就加 `--all` |
+| `ERROR: 无法按文本读取（toolarge）` | 文件超过 8 MB | 用原生工具，或先切分 |
+| `ERROR: 无法按文本读取（binary）` | 含 NUL 字节 | 二进制文件它不处理 |
+| 编辑成功但下次读说「变了」 | 你的编辑器在背后改了（格式化、保存钩子） | `state` 看版本号和 SHA-1，揪出是谁改的 |
+| 技能没出现 | 插件没装成 / 没重启 | `dsh plugin --profile web list` 看在不在，重启一次 |
+
+> 输出的提示都是中文，但 `ERROR:` 前缀和退出码（0 成功 / 2 失败）是稳定的，写脚本可以照着匹配。
+
+---
+
+## 兼容性
+
+在 DSH `0.2.1-rc.5` 上验证通过。技能注册档位 rank `600`（bundled）。如果你在 `~/.dsh/dsh-skill/file-state-cache` 也放了一份本地版，**本地版优先**。
+
+## 许可
 
 MIT

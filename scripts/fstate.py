@@ -207,7 +207,7 @@ def _key(path: Path) -> str:
 def def_boost(low: str, terms: list[str]) -> int:
     """这个词元在本文件里是「定义」形态吗？是则给一个大加分。
 
-    动机（实测）：查 createWorkBuddyAdapter 时，tests/adapter.spec.ts 里调用 6 次、
+    动机（实测）：查 createWidgetAdapter 时，tests/adapter.spec.ts 里调用 6 次、
     src/adapter.ts 里只在定义行出现 2 次 —— 只按出现次数排，答案被排到第 8 位，
     Agent 得先读几个测试文件才发现找错了。定义形态只出现在答案文件里。
     """

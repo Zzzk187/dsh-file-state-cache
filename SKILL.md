@@ -64,7 +64,7 @@ export FSTATE_PYTHON=/usr/bin/python3        # 或任意 python 可执行文件�
 "$F" explore "关键词" --root src --max-files 8   # 想看更多命中才加
 ```
 
-默认只显示 3 个文件、每个 3 条命中行（通常一次就够，输出约 1.5KB）。输出含：按相关度排序的命中文件（标题直接带**定义所在行号**和 `★定义` 标记）、命中行、第一名附近的签名与片段、被截断文件的路径清单（`其余:`）、以及**下一条该跑的命令**。
+默认只显示 3 个文件、每个 3 条命中行（通常一次就够，输出约 1.4KB）。输出含：按相关度排序的命中文件（标题直接带**定义所在行号**和 `★定义` 标记）、命中行、第一名附近的签名与片段、被截断文件的路径清单（`其余:`）、以及**下一条该跑的命令**。
 
 当第一名有定义命中且分数领先明显时，输出会进一步精简（省掉目录/后缀概览与签名）——答案已经没悬念，就不占篇幅。命中为空时换更短的词，不要加大 `--max-scan`；要更多细节才动 `--max-files` / `--max-hits` / `--snippet-lines`。
 
@@ -109,10 +109,10 @@ export FSTATE_PYTHON=/usr/bin/python3        # 或任意 python 可执行文件�
 
 | 子命令 | 作用 |
 | --- | --- |
-| `explore QUERY` | 一次成型：命中文件（带定义行号/`★定义`）+ 命中行 + 签名 + 片段 + 下一步命令 |
-| `read PATH` | 带缓存读：未变→摘要；变了→diff；`--mode range` 读区间 |
+| `explore QUERY` | 一次成型：命中文件（带定义行号/`★定义`）+ 命中行 + 签名 + 片段 + 下一步命令；`--max-files`（默认 3）/ `--max-hits`（默认 3）/ `--snippet-lines`（默认 4）/ `--max-scan` 控量 |
+| `read PATH` | 带缓存读：未变→摘要；变了→diff；`--mode range` 读区间；`--label 名字` 用名字替代 header 与 diff 里的路径 |
 | `edit PATH --old/--new` | 编辑并回 unified diff + 精确变更行区间 |
-| `write PATH --content-file` | 整篇写入（新建给预览，覆盖给 diff） |
+| `write PATH --content-file` | 整篇写入（新建给预览，覆盖给 diff；父目录不存在报错，要建加 `--mkdir`；空内容拒绝，要清空加 `--allow-empty`；读不成文本的原文件拒绝覆盖，要毁加 `--force`） |
 | `digest PATH...` | 多文件结构总览（行数 + 签名 + 缓存状态） |
 | `state PATH` | 版本 / 行数 / 读次数 / 上次编辑区间 / 是否 STALE |
 | `diff PATH` | 取最近一次 diff |

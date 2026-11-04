@@ -102,6 +102,11 @@ def _read_piece(file_arg: str, inline: str, flag: str) -> tuple[str, str]:
     返回 (内容, 错误信息)。出错时把 OSError 变成一句人话 —— 之前这里直接
     让 FileNotFoundError 冒到顶，用户看到的是一屏 Traceback。
     """
+    if file_arg and inline is not None and inline != "":
+        # 两个都给了：以前静默挑文件那个，另一个连个响都没有。
+        # 内联值和文件内容很可能完全不同，选错了改的就是别的东西。
+        return "", (f"ERROR: {flag} 和它的内联形式同时给了，不知道该用哪个。"
+                     "  二选一：要么只给内联值，要么只给文件。")
     if not file_arg:
         return inline, ""
     p = Path(file_arg)
@@ -544,7 +549,19 @@ def _atomic_write(path: Path, data: bytes) -> None:
             fh.write(data)
             fh.flush()
             os.fsync(fh.fileno())
-        os.replace(tmp, path)
+        # Windows 上 `os.replace` 遇到「目标正被另一个进程替换」会报
+        # PermissionError（拒绝访问），但那是**瞬时**的共享冲突，不是权限问题。
+        # 实测 20 个进程同时 write 同一个文件，6 个栽在这里，文案却劝用户
+        # 「检查权限、或文件是否被别的程序占用」—— 把一个能自己重试掉的事故
+        # 说成了用户的环境问题。多 agent 并行改同一个文件是真实场景，得兜住。
+        for attempt in range(6):
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:
+                if attempt == 5:
+                    raise
+                time.sleep(0.02 * (attempt + 1))
     except OSError:
         # 收拾残局，别把半成品临时文件留在用户目录里。
         try:
@@ -803,7 +820,13 @@ def cmd_read(args: argparse.Namespace) -> int:
         # （从没读过、或换了个会话、或文件刚被改过）。
         # 以前这里闭着眼睛说「本会话已完整交付过 vNone 的正文（此前调用 None 次）」，
         # 既没正文又给了个假保证 —— 正是本工具要消灭的那种话。
-        if not (body_delivered and same_session):
+        #
+        # 注意第一个条件 `changed_vs_cache`：`body_delivered` 比的是**缓存里**的
+        # full_version 与 version，磁盘变了它照样成立（v1 == v1）。于是
+        # 「首读 old → 外部改成 new → read --mode cached」会输出
+        # `版本 v2` + `内容未变（sha1 相同）` —— 同一个文件头说 v2、正文说没变，
+        # 这句「sha1 相同」是纯假的。磁盘变了就不是 cached，先判这个。
+        if changed_vs_cache or not (body_delivered and same_session):
             print(header)
             if changed_vs_cache:
                 print("内容已变（磁盘 sha1 与缓存不同），缓存里记的是上一次的内容，"
@@ -910,9 +933,19 @@ def cmd_read(args: argparse.Namespace) -> int:
             print(f"ERROR: 区间反向（start={s} > end={e}）。文件共 {total} 行，"
                   f"想看末尾用: --mode range --start {max(1, total - 20)} --end {total}")
             return 2
+        # 显式 --max-lines 在 range 里同样要算数：以前这个分支完全不看它，
+        # `--mode range --start 1 --end 200 --max-lines 10` 照样吐 200 行、
+        # 一个字不解释 —— 同一个参数在 full 里生效、在 range 里被静默吞掉。
+        want_lines = e - s + 1
+        if args.max_lines is not None and want_lines > args.max_lines:
+            e = s + args.max_lines - 1
         body = "\n".join(f"{i:5d}| {lines[i-1]}" for i in range(s, e + 1))
         out = f"{header}\n## 行 {s}..{e} / 共 {total} 行\n{body}"
         sp = _emit(out, args.max_chars, "read")
+        if args.max_lines is not None and want_lines > args.max_lines:
+            print(f"\n[只给了 {s}..{e}（--max-lines {args.max_lines}），"
+                  f"你要的还差 {want_lines - (e - s + 1)} 行。"
+                  f"继续: --mode range --start {e + 1} --end {s + want_lines - 1}]")
         if sp:
             # 区间行数不多但单行极长（压缩过的 JSON/bundle）时 _emit 仍会截断。
             # 这时不能再按「s..e 已读」记账，否则下次来读会被「内容未变」挡回去。
@@ -1043,7 +1076,7 @@ def cmd_edit(args: argparse.Namespace) -> int:
         print(oerr)
         return 2
     if args.new_file:
-        new, nerr = _read_piece(args.new_file, "", "--new-file")
+        new, nerr = _read_piece(args.new_file, args.new, "--new-file")
         if nerr:
             print(nerr)
             return 2
@@ -1310,7 +1343,20 @@ def cmd_write(args: argparse.Namespace) -> int:
         body += target_nl
 
     enc = codec + (" BOM" if bom else "") + (" CRLF" if target_nl == "\r\n" else "")
-    path.parent.mkdir(parents=True, exist_ok=True)
+    # 父目录不存在时**默认不替你造目录树**：`write sr/foo.ts` 这种把 src 打成 sr 的
+    # 手误，以前会默默 mkdir -p 出一棵新树、写出一个谁也不会读的文件、再报「已新建」，
+    # 而真正想改的那个文件一字节没动 —— 失败被自己的成功文案盖住了。
+    # 但「新建 src/new/dir/x.ts」是合理需求，所以留 --mkdir 显式授权。
+    if not path.parent.is_dir():
+        if not args.mkdir:
+            print(f"ERROR: 父目录不存在: {path.parent}")
+            print("  没有替你创建目录。先确认路径没打错；确实要新建这层目录就加 --mkdir。")
+            return 2
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            print(f"ERROR: 建不出目录 {path.parent}（{exc.strerror or exc}）。没写任何东西。")
+            return 2
     try:
         payload = bom + body.encode(codec)
     except UnicodeEncodeError as exc:
@@ -1369,7 +1415,9 @@ def cmd_write(args: argparse.Namespace) -> int:
     meta.update({
         "path": str(path.resolve()), "sha1": sha1_of(path), "lines": len(new_lines),
         "encoding": enc, "size": path.stat().st_size, "mtime": path.stat().st_mtime,
-        "version": (meta.get("version") or 0) + 1,
+        # 文件已经不在时（先删再写）版本号从 1 重新起算：`# 已新建 … → v2` 自相矛盾，
+        # 而这个 v2 是上一份文件留下的，对现在这份没有任何连续性可言（old_lines 也是空的）。
+        "version": 1 if not existed else (meta.get("version") or 0) + 1,
         "last_edit_at": time.time(), "last_edit_range": list(rng) if rng else None,
         "last_diff": diff[:200_000], "reason": args.reason or "",
         # 内容变了、行数也可能变了 —— 旧版本的「已读全文」凭证必须作废。
@@ -1444,7 +1492,13 @@ def cmd_digest(args: argparse.Namespace) -> int:
             print(f"ERROR: 这些路径不存在: {'、'.join(missing)}")
             print("  拼错了文件名不会得到「没有可摘要的文件」这种误导性提示——这里直接说哪个不存在。")
         else:
-            print("ERROR: 没有可摘要的文件（目录里没有常见源码后缀？可用 --max-files 放宽）")
+            # `--max-files 0` 把 uniq 切空，报的却是「目录里没有常见源码后缀」——
+            # 又是在解释一个没发生过的事。先分清「本来就没有」和「被我切掉了」。
+            if total_avail:
+                print(f"ERROR: --max-files {args.max_files} 把 {total_avail} 个候选文件全截掉了。")
+                print("  目录里确实有可摘要的文件，是上限设成了 0/太小。调大它再试。")
+            else:
+                print("ERROR: 没有可摘要的文件（目录里没有常见源码后缀？可用 --max-files 放宽）")
         return 2
     if missing:
         print(f"# ⚠ 跳过不存在的路径 {len(missing)} 个: {'、'.join(missing)}")
@@ -1881,11 +1935,11 @@ def main() -> int:
     e = sub.add_parser("explore", allow_abbrev=False, help="一次成型探索：目录概览 + 命中 + 签名 + 下一步")
     e.add_argument("query", help="要查的关键词（标识符、函数名、报错片段）")
     e.add_argument("--root", default=".", help="搜索根目录，默认当前目录")
-    e.add_argument("--max-files", type=int, default=3, help="详细列出几个命中文件（默认 3）")
-    e.add_argument("--max-hits", type=int, default=3, help="每文件列几处命中行（默认 3）")
-    e.add_argument("--max-sigs", type=int, default=6, help="每文件列几条签名（默认 6）")
-    e.add_argument("--snippet-lines", type=int, default=4, help="每处命中带几行上下文（默认 4）")
-    e.add_argument("--max-scan", type=int, default=6000, help="最多扫描多少个文件（默认 6000，超了会明说截断）")
+    e.add_argument("--max-files", type=_positive_int, default=3, help="详细列出几个命中文件（默认 3）")
+    e.add_argument("--max-hits", type=_positive_int, default=3, help="每文件列几处命中行（默认 3）")
+    e.add_argument("--max-sigs", type=_positive_int, default=6, help="每文件列几条签名（默认 6）")
+    e.add_argument("--snippet-lines", type=_positive_int, default=4, help="每处命中带几行上下文（默认 4）")
+    e.add_argument("--max-scan", type=_positive_int, default=6000, help="最多扫描多少个文件（默认 6000，超了会明说截断）")
     e.add_argument("--min-score", type=float, default=3.0, help="低于这个分数的命中不列（默认 3.0）")
     e.add_argument("--max-chars", type=_positive_int, default=24000, help="输出字符上限，超了落盘并只给预览（默认 24000）")
     e.set_defaults(fn=cmd_explore)
@@ -1934,6 +1988,8 @@ def main() -> int:
                          "utf-8-sig 带 BOM；utf-16-le 等宽编码会自动补 BOM")
     wr.add_argument("--force", action="store_true",
                     help="原文件读不成文本（二进制/超 8MB）时也强行覆盖 —— 默认拒绝")
+    wr.add_argument("--mkdir", action="store_true",
+                    help="父目录不存在时替你建出来 —— 默认报错（手误写错目录不该静默成功）")
     wr.add_argument("--allow-empty", action="store_true",
                     help="允许把非空文件写成空内容（默认拒绝：空输入多半是管道/临时文件没拿到内容）")
     wr.add_argument("--reason", default="", help="记一句为什么要改（写进缓存）")
@@ -1947,9 +2003,9 @@ def main() -> int:
 
     dg = sub.add_parser("digest", allow_abbrev=False, help="多文件结构摘要：行数 + 顶层签名 + 缓存状态")
     dg.add_argument("paths", nargs="+", help="文件或目录（可多个）")
-    dg.add_argument("--max-files", type=int, default=20, help="最多摘要几个文件（默认 20）")
-    dg.add_argument("--max-sigs", type=int, default=12, help="每文件列几条签名（默认 12）")
-    dg.add_argument("--max-scan", type=int, default=400, help="目录最多扫描几个文件（默认 400）")
+    dg.add_argument("--max-files", type=_positive_int, default=20, help="最多摘要几个文件（默认 20）")
+    dg.add_argument("--max-sigs", type=_positive_int, default=12, help="每文件列几条签名（默认 12）")
+    dg.add_argument("--max-scan", type=_positive_int, default=400, help="目录最多扫描几个文件（默认 400）")
     dg.add_argument("--all-ext", action="store_true", help="连非源码后缀（.md/.txt/无后缀）也摘要")
     dg.set_defaults(fn=cmd_digest)
 

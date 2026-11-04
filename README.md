@@ -96,7 +96,7 @@ That diff *is* the verification. The changed range (`14..14`) comes from `Sequen
 | `explore QUERY` | directory overview + ranked hit files + hit lines + signatures + snippets + next step |
 | `read PATH` | cached read: unchanged → summary, changed → diff, `--mode range` for a slice |
 | `edit PATH --old/--new` | edit and return a unified diff + exact changed line range |
-| `write PATH --content-file` | whole-file write (preview when new, diff when overwriting) |
+| `write PATH --content-file` | whole-file write (preview when new, diff when overwriting; a missing parent dir is an error unless you pass `--mkdir`) |
 | `digest PATH...` | structure of many files (line counts + signatures + cache state) |
 | `state PATH` | version / lines / read count / last edit range / STALE flag |
 | `diff PATH` | the last diff |

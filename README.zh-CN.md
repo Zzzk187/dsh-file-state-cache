@@ -167,7 +167,7 @@ python "<包根>\scripts\fstate.py" explore "关键词"
 | `explore QUERY` | 排序后的命中文件（带定义行号 / `★定义`）+ 命中行 + 签名 + 片段 + 下一步 |
 | `read PATH` | 带缓存读：未变→摘要，变了→diff，`--mode range` 读区间 |
 | `edit PATH --old/--new` | 编辑并回 unified diff + 精确变更行区间 |
-| `write PATH --content-file` | 整篇写入（新建给预览，覆盖给 diff） |
+| `write PATH --content-file` | 整篇写入（新建给预览，覆盖给 diff；父目录不存在会报错，要建加 `--mkdir`） |
 | `digest PATH...` | 多文件结构总览（行数 + 签名 + 缓存状态） |
 | `state PATH` | 版本 / 行数 / 读次数 / 上次编辑区间 / 是否 STALE |
 | `diff PATH` | 取最近一次 diff |

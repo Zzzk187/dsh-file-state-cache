@@ -74,14 +74,29 @@
 - **`--mode diff` 把「我刚 edit 过」栽赃给文件编码**：影子已被自己的写入同步成新内容，比不出差异属正常，却报「字节层可能变了（换行/BOM/编码）」。现在先判 `last_edit_at`，指向 `fstate.py diff` 回想那次改了什么。
 - **`hot` 从不报告 spill 目录**：溢出文件只增不减、`reset` 清不到，磁盘上越堆越多而没人知道。现在 `hot` 统计并明说「reset 不会清这里」。
 
+### 八、第四轮自查（续）
+
+- **`--mode cached` 在磁盘已变时仍说「内容未变（sha1 相同）」**：文件头写着 `版本 v2`，正文却说「内容未变」。根因是 `body_delivered` 比的是**缓存里**的 `full_version == version`，磁盘变没变它管不着（v1 == v1 照样成立）。同一个输出的上下两句话互相矛盾，而「sha1 相同」这句恰好是让人放心跳过重读的那句。现在先判 `changed_vs_cache`，磁盘变了就不是 cached。
+- **`write` 静默造目录树**：`write sr/foo.ts`（`src` 打成 `sr`）会默默 `mkdir -p` 出一棵新树、写出一个谁也不会读的文件、报「已新建」并 rc=0，而真正想改的那个文件一字节没动——**失败被自己的成功文案盖住了**。现在父目录不存在直接 `ERROR: 父目录不存在` + rc=2；要新建目录得显式 `--mkdir`。
+- **并发写同一个文件劝用户查权限**：20 个进程同时 `write` 一个文件时，Windows 的 `os.replace` 撞瞬时共享冲突（`PermissionError: 拒绝访问`），6/20 会失败并提示「检查权限、或文件是否被别的程序占用」——把一个能自己重试掉的事故说成了用户的环境问题。多 agent 并行改同一个文件是真实场景。现在最多重试 6 次（20ms 起退避）。
+- **删掉再写同一路径，版本号沿用上一份文件**：`# 已新建 n.txt → v2` 自相矛盾，而这个 v2 属于一份已经不存在的文件。现在 `existed` 为假时版本从 1 重新起算。
+- **`digest --max-files 0` 报「目录里没有常见源码后缀」**：其实目录里有，是上限把候选全切掉了。现在分开说「--max-files 0 把 N 个候选全截掉了」。
+- **`explore --max-scan -5` 打出「扫描在 -5 个文件处截断」**：负数上限被接受了，截断文案还照抄那个数。现在 `--max-scan` / `--max-files` 全部拒绝 ≤0（「必须 ≥1，收到 -5」）。
+- **`--mode range` 完全忽略显式 `--max-lines`**：`read f --mode range --start 1 --end 200 --max-lines 10` 照样吐满 200 行、零提示。同一个参数在 `full` 里生效、在 `range` 里被静默吞掉，而 range 恰恰是「我只要这一段」时最常用的模式。现在只给 10 行，并明说「你要的还差 190 行」加可直接照抄的续读命令；区间本来就小于上限时不打扰。
+- **内联值与 `--xxx-file` 同时给，静默挑一个**：`edit f --old a --new X --new-file g` 以前默认用文件那个，`--new X` 连个响都没有；`--old zzz --old-file of.txt` 同理。两个值可能完全不同，选错了改的就是别的东西。现在统一 `ERROR: --new-file 和它的内联形式同时给了，不知道该用哪个。` + rc=2，文件不动。
+- **其余「列几条」的上限参数接受负数**：`explore --max-hits -1` / `--max-sigs -2` / `--snippet-lines -1`、`digest --max-sigs -1` 会一路跑到无意义的输出。现在全部走 `_positive_int`，`必须 ≥1，收到 -1` + rc=2。
+
 ### 回归
 
-- `/c/tmp/fst/regress3.sh` 32 项全 PASS
-- `/c/tmp/fst/v110.sh` 24 项全 PASS（凭证/截断/字节层/编码）
-- `/c/tmp/fst/v111.sh` 28 项全 PASS（空输入/链接/读侧异常/坏缓存/msys 路径）
-- `/c/tmp/final/final.py` 20 项全 PASS（stdin 字节保真 / 新建文件末尾换行 / write 幂等 / 凭证四况 / 11 类文件 write 原样字节保真）
-- `/c/tmp/mtx/matrix.py` 18 类文件 × read/edit/write = 54 项全 PASS（UTF-8/CRLF/BOM/UTF-16-LE·BE/UTF-32-LE·BE/GBK/Latin-1/混合换行/空/仅 BOM/仅换行/无末尾换行/BOM+CRLF/CR-only）
-- `/c/tmp/atk2/atk2.py` 15 项全 PASS（stdin 各种输入 / 1MB 单行 / explore 120 文件与截断 / --label 特殊字符 / UTF-16 行号定位 / 混合换行 / write 幂等）
+多轮回归，累计 173 项，全部 PASS：
+
+- **核心回归 32 项**：edit 字节保真、write 规格、参数保护、错误路径、账本准确性、子命令存活
+- **凭证与字节层 24 项**：局部读后给全文、已交付后说内容未变、换会话给正文、write/edit 后给全文、cached 对未读说实话、`--mode diff` 两态、`--mode full` 给满、混合换行跨行编辑、不注入 CRLF、UTF-16-LE 可读回、CRLF 保真、无末尾换行不被补、二进制拒绝覆盖、spill 同秒不覆盖
+- **读侧与链接 28 项**：空输入不清空、`--allow-empty`、stdin 关闭、软链接保持链接、硬链接 nlink 不变、坏缓存不裸栈、msys `/c/...` 路径、陈旧 tmp 清理、explore/digest 遇不可读文件不崩
+- **字节矩阵 54 项**：11 类文件（UTF-8/CRLF/BOM/UTF-16-LE·BE/UTF-32-LE·BE/GBK/Latin-1/混合换行/空/仅 BOM/仅换行/无末尾换行/BOM+CRLF/CR-only）× read/edit/write，`write` 原样写回字节逐一致
+- **stdin 与边界 15 项**：stdin 多种输入、1MB 单行、explore 120 文件与截断、`--label` 特殊字符、UTF-16 行号定位、write 幂等
+- **探测组**：缓存键（相对/绝对/`./`/`../`/软链接共用一条记录）、影子副本与版本绑定、20 进程并发写同一文件与各自不同文件、20 进程并发读、中文/空格/emoji 路径、7MB 与 9MB 边界、只读文件、空文件、`--old ''`、越界 range、`write` 到不存在目录、`diff` 三态、`explore` 各种 `--root`
+- **最后一轮**：`--mode range --max-lines`、内联值与 `--xxx-file` 冲突、4 个上限参数负数，逐条手工复验 rc 与文件字节
 
 ## 1.0.8 — 2026-11-04
 
@@ -99,7 +114,7 @@
 - **`read --label` 在 header 里也显示**（形如 `配置解析  (绝对路径)`），绝对路径这个定位信息保留。
 - **`_bump` 不再堆积重复区间**：连续读同一段以前会记成 `[[1,1],[1,1],[1,1]]`，「已记录的区间」提示变成一串噪音。
 
-- **回归**：`/c/tmp/fst/regress3.sh` 32 项全 PASS。
+- **回归**：核心回归 32 项全 PASS。
 
 ## 1.0.7 — 2026-11-04
 
@@ -113,7 +128,7 @@
 - **超大 diff 截断时也明说**：`read` 的 changed 分支和 `edit` 的 diff 输出被截断时，补一行「这份 diff 没完整进入上下文，消失的那部分只在溢出文件里；下一次 read 会说内容未变，不会再把这段差异给你」/「文件本身已是新版，不用重读；要完整差异用 `diff` 或看溢出文件」。`last_diff` 存的是 20 万字符内的全文，所以 `diff` 子命令确实能补上。
 - **`mode="truncated"` 仍存影子副本**：影子副本是给「下次内容变了算 diff」用的，与这次打印了多少字无关。不存的话，大文件首读后一旦被外部改动，下次只能降级回全文。
 
-- **回归**：`/c/tmp/fst/regress3.sh` 32 项全 PASS（含 `range-exact` 校验账本区间精确性、`trunc-not-recorded` 校验截断后不记账、`trunc-reread` 校验重读不再报「内容未变」）。
+- **回归**：核心回归 32 项全 PASS（含 `range-exact` 校验账本区间精确性、`trunc-not-recorded` 校验截断后不记账、`trunc-reread` 校验重读不再报「内容未变」）。
 
 ## 1.0.6 — 2026-11-04
 

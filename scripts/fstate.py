@@ -712,7 +712,12 @@ def cmd_edit(args: argparse.Namespace) -> int:
           + (f"  区间 {rng[0]}..{rng[1]}" if rng else ""))
     if args.reason:
         print(f"# reason: {args.reason}")
-    print(diff)
+    # edit 的 diff 以前是裸 print(diff)：一次 --all 大改能刷出几十 KB，把上下文吃掉，
+    # 而 write 早就有 --max-chars 兜着。同一个技能里两套规矩，最常用的那条偏偏没上限。
+    sp = _emit(diff, args.max_chars, "diff")
+    if sp:
+        print(f"\n[注意：这次 diff 没完整进入上下文，被截掉的部分只在 {sp}。"
+              f"文件本身已是新版，不用重读；要完整差异用 diff {args.path}。]")
     if rng:
         print(f"\n[确认改动不必重读全文：看局部用 --mode range --start {rng[0]} --end {rng[1]}]")
     return 0
@@ -1209,6 +1214,7 @@ def main() -> int:
     w.add_argument("--all", action="store_true")
     w.add_argument("--reason", default="")
     w.add_argument("--label", default="")
+    w.add_argument("--max-chars", type=int, default=12000)
     w.set_defaults(fn=cmd_edit)
 
     wr = sub.add_parser("write", allow_abbrev=False, help="新建/覆盖并回 diff")

@@ -927,8 +927,16 @@ def cmd_state(args: argparse.Namespace) -> int:
     if not meta:
         print(f"{path}: 无缓存（还没用 fstate read 过）")
         return 0
-    disk = sha1_of(path) if path.is_file() else "missing"
-    stale = "STALE（磁盘已变，需要 --mode full 重新加载）" if disk != meta.get("sha1") else "fresh"
+    disk = sha1_of(path) if path.is_file() else None
+    if disk is None:
+        # 文件没了和文件改了是两回事：前者让你去 --mode full 也读不出来。
+        # 以前这两种都回「STALE（磁盘已变，需要 --mode full 重新加载）」，
+        # 照着提示做只会得到「文件不存在」，白跑一趟。
+        stale = "MISSING（文件已不存在；缓存记录还在，文件恢复后会自动比对新旧）"
+    elif disk != meta.get("sha1"):
+        stale = "STALE（磁盘已变，需要 --mode full 重新加载）"
+    else:
+        stale = "fresh"
     print(json.dumps({
         "path": meta.get("path"),
         "version": meta.get("version"),

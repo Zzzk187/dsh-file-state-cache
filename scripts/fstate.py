@@ -547,10 +547,6 @@ def cmd_read(args: argparse.Namespace) -> int:
     show = lines[:limit]
     body = "\n".join(f"{i:5d}| {ln}" for i, ln in enumerate(show, 1))
     out = f"{header}\n{body}"
-    if limit < total:
-        out += (
-            f"\n\n[已显示前 {limit}/{total} 行。继续: --mode range --start {limit+1} --end {min(total, limit+300)}]"
-        )
     sp = _emit(out, args.max_chars, "read")
     if sp or limit < total:
         # 两种情况都没把全文交给调用方：单行超长被 _emit 截断，或 --max-lines 截断。
@@ -561,6 +557,9 @@ def cmd_read(args: argparse.Namespace) -> int:
         if sp:
             print(f"\n[全文未完整进入上下文，未记为已读。缩小范围重读: "
                   f"--mode range --start 1 --end {min(total, 200)}]")
+        elif limit < total:
+            print(f"\n[已显示前 {limit}/{total} 行，不算读过（重新 read 会再给一遍）。"
+                  f"继续: --mode range --start {limit+1} --end {min(total, limit+300)}]")
         _bump(path, meta, disk, lines, enc, mode="truncated", rng=None, version=next_version)
         return 0
     _bump(path, meta, disk, lines, enc, mode="full", rng=(1, len(show)), version=next_version)

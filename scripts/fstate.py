@@ -43,6 +43,22 @@ def _force_utf8() -> None:
             pass
 
 
+def _positive_line(raw: str) -> int:
+    """argparse 的 type 校验：行号必须 ≥1（1-based）。
+
+    以前 `--start 0` 会被 `max(1, args.start)` 悄悄抬到 1，于是「--start 0 --end 2」
+    静默回报第 1..2 行 —— 调用方以为自己在读第 0 行往后，实际偏移一行且毫无提示。
+    这类「纠正得很合理、但没告诉你纠正了」的宽容，和静默截断是同一类毛病。
+    """
+    try:
+        val = int(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"行号得是整数，收到 {raw!r}") from None
+    if val < 1:
+        raise argparse.ArgumentTypeError(f"行号从 1 开始，收到 {val}（0 和负数无意义）")
+    return val
+
+
 def _read_stdin_text() -> str:
     """读 stdin 的全部文本。
 
@@ -351,10 +367,17 @@ def split_lines(text: str) -> list[str]:
     return text.splitlines()
 
 
-def _emit(text: str, max_chars: int, kind: str) -> None:
+def _emit(text: str, max_chars: int, kind: str) -> str | None:
+    """输出文本。超长时落盘全文、只回「头 60% + 尾 30%」的预览。
+
+    返回值：落盘路径（**只有真截断时才非 None**）。调用方必须处理这个返回值 ——
+    只 print 不管的话，就会重演「输出砍了、账本却记成看全了」：下一次 `read` 拿
+    sha1 一比发现没变，回一句「内容未变，此前已读 1 次」，于是一段从没进过对话的
+    正文就被永久跳过了。这正是本项目要消灭的那类失败（答案在，但没被看见）。
+    """
     if len(text) <= max_chars:
         print(text)
-        return
+        return None
     spill_dir = CACHE_HOME / "spill"
     spill_dir.mkdir(parents=True, exist_ok=True)
     sp = spill_dir / f"{time.strftime('%Y%m%d-%H%M%S')}-{kind}.txt"
@@ -365,6 +388,7 @@ def _emit(text: str, max_chars: int, kind: str) -> None:
     print(f"\n... [已截断 {len(text) - len(head) - len(tail)} 字符] ...\n")
     print(tail)
     print(f"\n[全文 {len(text)} 字符已落盘: {sp}]")
+    return str(sp)
 
 
 def unified(a: list[str], b: list[str], rel: str, ctx: int = 3) -> str:
@@ -435,7 +459,10 @@ def cmd_read(args: argparse.Namespace) -> int:
         # 显式给了行范围就是想要局部正文，别拿「内容未变」把请求挡回去
         if args.start is not None or args.end is not None:
             mode = "range"
-        elif not changed_vs_cache and meta.get("read_count", 0) > 0:
+        elif not changed_vs_cache and meta.get("read_count", 0) > 0 and meta.get("read_ranges"):
+            # 只有**真记过区间**才允许走「内容未变」的免读分支。read_ranges 为空说明
+            # 上次是被截断的（--max-lines 或单行超长），正文根本没进过上下文；
+            # 此时回一句「已读 1 次」等于把那段内容永久跳过。
             mode = "cached"
         elif changed_vs_cache:
             mode = "changed"
@@ -450,10 +477,13 @@ def cmd_read(args: argparse.Namespace) -> int:
     header = f"# {path}  版本 v{next_version}  {total} 行  [{enc}]"
 
     if mode == "cached":
-        last = [f"{r[0]}..{r[1]}" for r in (meta.get("read_ranges") or [])][-3:]
+        recorded = [f"{r[0]}..{r[1]}" for r in (meta.get("read_ranges") or [])][-3:]
+        # 没记下任何区间时**不能**说「最近读的范围: 全文」—— 那可能是上次被
+        # --max-lines / 单行超长截断后留下的记录，全文从未进过上下文。
+        where = f"已记录的区间: {recorded}" if recorded else "尚未有完整区间记录（上次可能被截断）"
         hint = (
             f"内容未变（sha1 相同）。此前已读 {meta.get('read_count')} 次；"
-            f"最近读的范围: {last or ['全文']}。需要正文请用 --mode range/full。"
+            f"{where}。需要正文请用 --mode range/full。"
         )
         print(header)
         print(hint)
@@ -475,16 +505,22 @@ def cmd_read(args: argparse.Namespace) -> int:
             rng = changed_lines_range(old_lines, lines) or hunks_new_range(d)
             print(header)
             print(f"## 磁盘内容已变（v{meta.get('version', 0)+1}），以下仅为差异：\n")
-            _emit(d, args.max_chars, "diff")
+            sp = _emit(d, args.max_chars, "diff")
             if rng:
                 print(f"\n[变更行区间(新文件): {rng[0]}..{rng[1]}]  看局部: --mode range --start {rng[0]} --end {rng[1]}")
+            if sp:
+                # diff 本身被截断：影子副本仍会更到新内容，于是下一次 read 会说「内容未变」。
+                # 必须现在就说清楚——只有溢出文件里有完整差异，别以为看完这段就等于看全了。
+                print("\n[注意：这份 diff 没完整进入上下文，消失的那部分只在上面那个溢出文件里。"
+                      "下一次 read 会说「内容未变」，不会再把这段差异给你。]")
             _bump(path, meta, disk, lines, enc, mode="changed", rng=rng, diff=d, version=next_version)
             return 0
         # 没有影子副本 → 老实给全文
         mode = "full"
 
     if mode == "range":
-        s = max(1, args.start or 1)
+        # args.start 已由 argparse 的 `type=_positive_int` 保证 ≥1，这里只管补默认值
+        s = args.start or 1
         e = min(total, args.end or min(total, s + 199))
         if s > total:
             print(f"ERROR: start={s} 超过总行数 {total}")
@@ -494,7 +530,15 @@ def cmd_read(args: argparse.Namespace) -> int:
                   f"想看末尾用: --mode range --start {max(1, total - 20)} --end {total}")
             return 2
         body = "\n".join(f"{i:5d}| {lines[i-1]}" for i in range(s, e + 1))
-        print(f"{header}\n## 行 {s}..{e} / 共 {total} 行\n{body}")
+        out = f"{header}\n## 行 {s}..{e} / 共 {total} 行\n{body}"
+        sp = _emit(out, args.max_chars, "read")
+        if sp:
+            # 区间行数不多但单行极长（压缩过的 JSON/bundle）时 _emit 仍会截断。
+            # 这时不能再按「s..e 已读」记账，否则下次来读会被「内容未变」挡回去。
+            print(f"\n[本区间未完整进入上下文，因此未记为已读。原文见上方 spill 文件，"
+                  f"或缩小范围重读: --mode range --start {s} --end {max(s, e - 50)}]")
+            _bump(path, meta, disk, lines, enc, mode="truncated", rng=None, version=next_version)
+            return 0
         _bump(path, meta, disk, lines, enc, mode="range", rng=(s, e), version=next_version)
         return 0
 
@@ -507,8 +551,19 @@ def cmd_read(args: argparse.Namespace) -> int:
         out += (
             f"\n\n[已显示前 {limit}/{total} 行。继续: --mode range --start {limit+1} --end {min(total, limit+300)}]"
         )
-    _emit(out, args.max_chars, "read")
-    _bump(path, meta, disk, lines, enc, mode="full", rng=(1, limit), version=next_version)
+    sp = _emit(out, args.max_chars, "read")
+    if sp or limit < total:
+        # 两种情况都没把全文交给调用方：单行超长被 _emit 截断，或 --max-lines 截断。
+        # 旧的记账按 (1, limit) 落 read_ranges 且照样 bump read_count —— 于是下一次
+        # read 会理直气壮地说「内容未变，此前已读 1 次」，把没进过对话的正文跳过。
+        # 现在改成 mode="truncated" + rng=None：read_count 仍计（这确实是次读），
+        # 但读过的区间一笔不记。
+        if sp:
+            print(f"\n[全文未完整进入上下文，未记为已读。缩小范围重读: "
+                  f"--mode range --start 1 --end {min(total, 200)}]")
+        _bump(path, meta, disk, lines, enc, mode="truncated", rng=None, version=next_version)
+        return 0
+    _bump(path, meta, disk, lines, enc, mode="full", rng=(1, len(show)), version=next_version)
     return 0
 
 
@@ -537,8 +592,11 @@ def _bump(path: Path, meta: dict, disk: str, lines: list[str], enc: str,
         "last_read_at": now,
         "read_ranges": ranges[-20:],
     })
-    if path.stat().st_size <= SHADOW_LIMIT and mode in ("full", "changed", "cached"):
-        if not meta.get("shadow") or mode in ("full", "changed"):
+    if path.stat().st_size <= SHADOW_LIMIT and mode in ("full", "changed", "cached", "truncated"):
+        # mode="truncated" 也要存影子副本：影子副本是给「下次内容变了算 diff」用的，
+        # 跟这次打印了多少字无关。不存的话，大文件首次读后一旦被外部改动，
+        # 下次只能降级回全文 —— 把本来能省的又还回去了。
+        if not meta.get("shadow") or mode in ("full", "changed", "truncated"):
             if save_shadow(path, lines):
                 meta["shadow"] = True
                 meta.pop("shadow_error", None)
@@ -757,7 +815,11 @@ def cmd_write(args: argparse.Namespace) -> int:
     if args.reason:
         print(f"# reason: {args.reason}")
     if diff:
-        _emit(diff, args.max_chars, "diff")
+        sp = _emit(diff, args.max_chars, "diff")
+        if sp:
+            # 改是真改了（字节已落盘），但证据没给全。让人别把「预览」当「全部」。
+            print(f"\n[注意：这次 diff 没完整进入上下文，被截掉的部分只在 {sp}。"
+                  f"文件本身已是新版，不用重读；要完整差异就看那个文件或用 diff {args.path}。]")
     else:
         preview = "\n".join(f"{i:5d}| {ln}" for i, ln in enumerate(new_lines[:10], 1))
         print(preview)
@@ -1126,8 +1188,11 @@ def main() -> int:
     r = sub.add_parser("read", allow_abbrev=False, help="带缓存的读")
     r.add_argument("path")
     r.add_argument("--mode", default="auto", choices=["auto", "full", "range", "diff", "changed", "cached"])
-    r.add_argument("--start", type=int)
-    r.add_argument("--end", type=int)
+    # 行号是 1-based。以前 --start 0 会被 max(1, ...) 悄悄改成第 1 行，于是
+    # 「--start 0 --end 2」静默等价于「1..2」—— 调用方以为自己在读第 0 行往后的
+    # 东西，实际偏移了一行还浑然不觉。宁可报错，不猜。
+    r.add_argument("--start", type=_positive_line)
+    r.add_argument("--end", type=_positive_line)
     r.add_argument("--max-lines", type=int, default=400)
     r.add_argument("--max-chars", type=int, default=20000)
     r.add_argument("--label", default="")

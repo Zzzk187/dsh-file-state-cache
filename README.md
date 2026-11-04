@@ -13,11 +13,13 @@
 | Waste | Before | With this skill |
 |---|---|---|
 | **Exploration round-trips** | `ls`, then `grep`, then a blind `read` — three turns | one `explore "keyword"` → ranked hit files (with the **definition line number**) + hit lines + signatures + snippets + the next command to run, ~1.5 KB |
-| **Re-reading unchanged files** | full file again, every time | one line: *"unchanged, read N times before, last range …"* |
+| **Re-reading unchanged files** | full file again, every time | one line: *"unchanged, and this session already delivered the full body of v2"* |
 | **Verifying an edit** | re-read the whole file | the unified diff + the **exact** changed line range |
 | **Reading N files to understand a structure** | N reads | one `digest` → N signatures in one screen |
 
 The state lives **on disk**, not in the agent's context. That is the whole trick: it survives across tool calls, turns, and restarts. A plain tool invocation cannot do that, which is why this is a CLI plus a skill rather than a set of registered tools.
+
+But the **"this body was already delivered"** receipt is only valid **within the current session**. What survives across sessions is *"I have read this file, it is at version N, my last edit touched lines X..Y"* — not *"it is in your context right now"*. So after a session change or a context reset, `read` hands you the body again instead of dismissing you with "unchanged". That boundary is deliberate: a tool whose entire job is saving context must never manufacture the illusion of having seen something.
 
 **Measured** on a 115-file TypeScript project over 538 real queries: `explore` averages 1.4 KB, puts the answer file first 93.6% of the time and in the top three 100% of the time. Touching the same file 4 times in a session saves 65%; editing N places with one confirmation each saves a steady 88%. But for a **one-shot task where you read a file once**, it loses — see [when not to use it](#when-not-to-use-it).
 

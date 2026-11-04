@@ -474,7 +474,11 @@ def cmd_read(args: argparse.Namespace) -> int:
         next_version = 1
     elif changed_vs_cache:
         next_version += 1
-    header = f"# {path}  版本 v{next_version}  {total} 行  [{enc}]"
+    # --label 只影响 diff 里的 a/ b/ 前缀（去 diff 对比过，header 一直是绝对路径）。
+    # 这是有意的：header 里的绝对路径是唯一能让人立刻定位到磁盘上哪个文件的信息，
+    # 被一个自定标签顶掉反而更糊涂。想看相对路径就靠 rel。
+    shown = f"{args.label}  ({path})" if args.label else path
+    header = f"# {shown}  版本 v{next_version}  {total} 行  [{enc}]"
 
     if mode == "cached":
         recorded = [f"{r[0]}..{r[1]}" for r in (meta.get("read_ranges") or [])][-3:]

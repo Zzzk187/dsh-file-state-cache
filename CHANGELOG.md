@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.0.6 — 2026-11-04
+
+这一版全是**「出错时怎么说话」**的问题，但其中一条会**静默毁数据**。它们共同点：功能测试全绿，坏在参数解析和异常路径上。
+
+- **漏给 `--new` 会静默删内容（最危险）**：`--new` 的 `default=""` 让 `fstate.py edit f.txt --old TARGET` 被理解成「把 TARGET 换成空」——`keep\nTARGET\nkeep2\n` 变成 `keep\n\nkeep2\n`，输出还说「已改」。`default` 现在改成 `None`，漏给时报 `ERROR: 需要 --new/--new-file` 并**明确提示**「想删除这段内容，请显式传 `--new ''`」，退出码 2，文件不动。显式传空串仍能删除。
+
+- **argparse 前缀缩写会吃掉参数**：`--content hi` 被解析成 `--content-file hi`，于是报 `FileNotFoundError: 'hi'` —— 错误信息与真实原因毫无关系；更糟的是 `--old abc` 会先匹配 `--old-file`，把 `abc` 当文件名去读。主 parser 和**全部 9 个子 parser** 都加了 `allow_abbrev=False`（子 parser 的这个参数是独立的，主 parser 关掉不管用）。代价是 `--cont` 这种缩写不再可用。
+
+- **换行归一 old / new 各管各的**：旧逻辑 `if "\r\n" in text and "\r\n" not in old:` 在 `--old` 自带 CRLF 时整块跳过，`--new` 里的裸 LF 就不归一了，于是 CRLF 文件被写出混合换行（`4141410a4242420d0a`）。现在文件是 CRLF 时 `old` 与 `new` **分别**归一，`new` 无条件转；文件是 LF 时反向把 CRLF 压成 LF，不让调用方被带偏。
+
+- **`--stdin` 传中文崩溃**：Windows 管道进来的是系统 ANSI 页（cp936）字节，`sys.stdin.read()` 会拿到孤立代理字符（`'\udcad'`），`encode("utf-8")` 直接抛 `UnicodeEncodeError: surrogates not allowed`。改为 `_read_stdin_text()` 读 `sys.stdin.buffer` 原始字节，按 `utf-8-sig` → `gbk` 解码，都失败才 `errors="replace"` 兜底。
+
+- **异常路径不再吐 Traceback**：`--old-file` / `--new-file` / `--content-file` 指向不存在的文件、`write` 到只读/被占用文件，以前都是裸 `FileNotFoundError` / `PermissionError` 冒到顶（rc=1）。现在统一一句人话（`ERROR: --old-file 指向的文件不存在: nope.txt`、`ERROR: 写不进 ...（Permission denied）` + `文件没被改动`），退出码 2。
+
+- **`--old` 与 `--new` 相同时不再虚报**：以前 md5 没变也输出「已改 → v1」并 bump 缓存版本。现在打 `# 没变化：old 与 new 相同，xxx 原样未动（缓存版本未变）`，不写盘、不 bump。
+
+- **回归**：`/tmp/fst/regress2.sh` 26 项全 PASS（edit 字节保真 5 / write 规格 4 / 新增保护 7 / 错误路径 4 / 子命令存活 7）。
+
 ## 1.0.5 — 2026-11-04
 
 这一版只修一件事，但是**会毁文件的**那种：`edit` / `write` 会给每个写过的文件盖上 UTF-8 BOM，并把 CRLF 压成 LF、把非 UTF-8 编码悄悄换成 UTF-8。所有功能测试都是绿的 —— 它坏的是**字节层**，而下一次读这个文件的工具（`JSON.parse`、`bash`、解释器）在别处炸掉。

@@ -43,6 +43,43 @@ def _force_utf8() -> None:
             pass
 
 
+def _read_stdin_text() -> str:
+    """读 stdin 的全部文本。
+
+    Windows 上管道/重定向进来的是**系统 ANSI 页**的字节（本机 cp936），不是 UTF-8。
+    `sys.stdin` 的默认解码器带 surrogateescape 时，中文会变成孤立代理字符：读的时候
+    不报错，等 `body.encode("utf-8")` 才炸，错误位置离现场很远。所以这里绕过文本层，
+    按字节读，显式按 utf-8-sig -> gbk 试。
+    """
+    raw = sys.stdin.buffer.read()
+    for enc in ("utf-8-sig", "gbk"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
+def _read_piece(file_arg: str, inline: str, flag: str) -> tuple[str, str]:
+    """读 --old-file / --new-file 这类「片段来自文件」的参数。
+
+    返回 (内容, 错误信息)。出错时把 OSError 变成一句人话 —— 之前这里直接
+    让 FileNotFoundError 冒到顶，用户看到的是一屏 Traceback。
+    """
+    if not file_arg:
+        return inline, ""
+    p = Path(file_arg)
+    if not p.is_file():
+        return "", f"ERROR: {flag} 指向的文件不存在: {file_arg}"
+    try:
+        # 内容片段可能带 BOM（Windows 编辑器很爱加），utf-8-sig 会顺手剥掉
+        return p.read_text(encoding="utf-8-sig"), ""
+    except OSError as exc:
+        return "", f"ERROR: 读不了 {flag}（{file_arg}）：{exc.strerror or exc}"
+    except UnicodeDecodeError:
+        return "", f"ERROR: {flag} 不是 UTF-8/GBK 文本: {file_arg}"
+
+
 SKIP_DIRS = {
     ".git", ".hg", ".svn", "node_modules", "dist", "build", "out", "obj", "bin",
     "__pycache__", ".venv", "venv", "env", ".next", ".nuxt", "target", "coverage",
@@ -528,20 +565,38 @@ def cmd_edit(args: argparse.Namespace) -> int:
         print(f"ERROR: 无法按文本编辑（{why}）: {path}")
         return 2
     text, enc = tf.text, tf.label
-    old = Path(args.old_file).read_text(encoding="utf-8-sig") if args.old_file else args.old
-    new = Path(args.new_file).read_text(encoding="utf-8-sig") if args.new_file else (args.new or "")
+    old, oerr = _read_piece(args.old_file, args.old, "--old-file")
+    if oerr:
+        print(oerr)
+        return 2
+    if args.new_file:
+        new, nerr = _read_piece(args.new_file, "", "--new-file")
+        if nerr:
+            print(nerr)
+            return 2
+    elif args.new is None:
+        # 漏给 --new 时以前的 default="" 会把 old 静默替换成空，文件内容被删掉，
+        # 而输出还说「已改」—— 这是最危险的一类：错得很安静、后果在别处才暴露。
+        print("ERROR: 需要 --new/--new-file")
+        print("  想删除这段内容，请显式传 --new ''（空串）。")
+        return 2
+    else:
+        new = args.new
     if not old:
         print("ERROR: 需要 --old/--old-file")
         return 2
 
     # 换行宽容：调用方传片段时几乎总是 LF，而 Windows 上的文件多为 CRLF。
     # 不归一的话同一段文本也会匹配失败，逼调用方手动转换行符。
-    if "\r\n" in text and "\r\n" not in old:
-        old = old.replace("\r\n", "\n").replace("\n", "\r\n")
+    # 两个方向都要管，而且 old / new 各归一各的：文件是 CRLF 时，即使 old 已经带
+    # CRLF，new 里的裸 LF 也得换 —— 否则改完那行是 LF、邻行是 CRLF，文件变成混合换行。
+    if "\r\n" in text:
+        if "\r\n" not in old:
+            old = old.replace("\r\n", "\n").replace("\n", "\r\n")
         new = new.replace("\r\n", "\n").replace("\n", "\r\n")
-    elif "\r\n" not in text and "\r\n" in old:
+    else:
         old = old.replace("\r\n", "\n")
-        new = new.replace("\r\n", "\n")
+        new = new.replace("\r\n", "\n").replace("\r", "\n")
 
     count = text.count(old)
     if count == 0:
@@ -561,6 +616,11 @@ def cmd_edit(args: argparse.Namespace) -> int:
     old_lines = split_lines(text)
     new_text = text.replace(old, new) if args.all else text.replace(old, new, 1)
     new_lines = split_lines(new_text)
+    if new_text == text:
+        # --old 与 --new 相同时会走到这里。别报「已改」——那会让调用方以为改动了、
+        # 进而跳过自己本该做的检查；缓存版本也不该为此加一。
+        print(f"# 没变化：old 与 new 相同，{path.name} 原样未动（缓存版本未变）")
+        return 0
     try:
         write_back(path, tf, new_text)
     except UnicodeEncodeError as exc:
@@ -568,6 +628,10 @@ def cmd_edit(args: argparse.Namespace) -> int:
         # 而不是让它 half-write 或悄悄改成 UTF-8 把后面所有工具都搞坏。
         print(f"ERROR: 新内容无法用原编码 {tf.encoding} 编码：{exc}")
         print(f"  文件没被改动。要改用别的编码请用: fstate.py write {path} --encoding utf-8 ...")
+        return 2
+    except OSError as exc:
+        print(f"ERROR: 写不进 {path}（{exc.strerror or exc}）")
+        print("  文件没被改动。检查权限、或文件是否被别的程序占用。")
         return 2
     diff = unified(old_lines, new_lines, args.label or path.name)
     rng = changed_lines_range(old_lines, new_lines) or hunks_new_range(diff)
@@ -611,10 +675,12 @@ def cmd_write(args: argparse.Namespace) -> int:
         print(f"ERROR: 这是目录不是文件: {path}")
         return 2
     if args.content_file:
-        # 内容文件本身可能带 BOM（Windows 编辑器很爱加），utf-8-sig 会顺手剥掉
-        body = Path(args.content_file).read_text(encoding="utf-8-sig")
+        body, cerr = _read_piece(args.content_file, "", "--content-file")
+        if cerr:
+            print(cerr)
+            return 2
     elif args.stdin:
-        body = sys.stdin.read()
+        body = _read_stdin_text()
     else:
         print("ERROR: 需要 --content-file 或 --stdin")
         return 2
@@ -654,6 +720,12 @@ def cmd_write(args: argparse.Namespace) -> int:
     except UnicodeEncodeError as exc:
         print(f"ERROR: 内容无法用 {codec} 编码：{exc}")
         print("  文件没被改动。换编码请加 --encoding utf-8")
+        return 2
+    except OSError as exc:
+        # 只读文件 / 目录不可写 / 被别的进程占着 —— 说清楚是哪个环节失败，
+        # 别让用户对着一屏 Traceback 猜。
+        print(f"ERROR: 写不进 {path}（{exc.strerror or exc}）")
+        print("  文件没被改动。检查权限、或文件是否被别的程序占用。")
         return 2
 
     # 写完自检：重新读回来必须与写进去的一模一样，否则说明编码规格选错了 ——
@@ -1030,10 +1102,16 @@ def cmd_explore(args: argparse.Namespace) -> int:
 
 def main() -> int:
     _force_utf8()
-    ap = argparse.ArgumentParser(prog="fstate.py", description="文件状态缓存 CLI")
+    # allow_abbrev=False：否则 `--content hi` 会被 argparse 当成 `--content-file hi`
+    # 的前缀缩写（--content 是 --content-file 的前缀），于是 "hi" 被当文件名去读，
+    # 报一个跟真实原因毫无关系的 FileNotFoundError。前缀缩写只省几个字符，坑却很深。
+    ap = argparse.ArgumentParser(prog="fstate.py", description="文件状态缓存 CLI", allow_abbrev=False)
+    # subparsers 的 allow_abbrev 是**独立**的（3.8+ 才支持这个参数），这里的 --old/--new
+    # 才是最容易写错的：`--old` 会先匹配上 `--old-file`，让 "--old abc" 变成
+    # 「读 abc 这个文件当 old」。主 parser 关掉不管用，子 parser 必须各自关。
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    e = sub.add_parser("explore", help="一次成型探索")
+    e = sub.add_parser("explore", allow_abbrev=False, help="一次成型探索")
     e.add_argument("query")
     e.add_argument("--root", default=".")
     e.add_argument("--max-files", type=int, default=3)
@@ -1045,7 +1123,7 @@ def main() -> int:
     e.add_argument("--max-chars", type=int, default=24000)
     e.set_defaults(fn=cmd_explore)
 
-    r = sub.add_parser("read", help="带缓存的读")
+    r = sub.add_parser("read", allow_abbrev=False, help="带缓存的读")
     r.add_argument("path")
     r.add_argument("--mode", default="auto", choices=["auto", "full", "range", "diff", "changed", "cached"])
     r.add_argument("--start", type=int)
@@ -1055,10 +1133,13 @@ def main() -> int:
     r.add_argument("--label", default="")
     r.set_defaults(fn=cmd_read)
 
-    w = sub.add_parser("edit", help="编辑并回 diff")
+    w = sub.add_parser("edit", allow_abbrev=False, help="编辑并回 diff")
     w.add_argument("path")
     w.add_argument("--old", default="")
-    w.add_argument("--new", default="")
+    # default=None 而不是 ""：默认空串的话，调用方漏给 --new 时会被当成
+    # 「把 old 替换成空」——明明是忘了参数，结果内容被静默删掉，diff 里还显示
+    # 「已改」。设成 None 才能区分「没给」和「显式给了空串（=删除）」。
+    w.add_argument("--new", default=None)
     w.add_argument("--old-file", default="")
     w.add_argument("--new-file", default="")
     w.add_argument("--all", action="store_true")
@@ -1066,7 +1147,7 @@ def main() -> int:
     w.add_argument("--label", default="")
     w.set_defaults(fn=cmd_edit)
 
-    wr = sub.add_parser("write", help="新建/覆盖并回 diff")
+    wr = sub.add_parser("write", allow_abbrev=False, help="新建/覆盖并回 diff")
     wr.add_argument("path")
     wr.add_argument("--content-file", default="")
     wr.add_argument("--stdin", action="store_true")
@@ -1076,11 +1157,11 @@ def main() -> int:
     wr.add_argument("--max-chars", type=int, default=12000)
     wr.set_defaults(fn=cmd_write)
 
-    s = sub.add_parser("state", help="文件状态")
+    s = sub.add_parser("state", allow_abbrev=False, help="文件状态")
     s.add_argument("path")
     s.set_defaults(fn=cmd_state)
 
-    dg = sub.add_parser("digest", help="多文件结构摘要")
+    dg = sub.add_parser("digest", allow_abbrev=False, help="多文件结构摘要")
     dg.add_argument("paths", nargs="+")
     dg.add_argument("--max-files", type=int, default=20)
     dg.add_argument("--max-sigs", type=int, default=12)
@@ -1088,16 +1169,16 @@ def main() -> int:
     dg.add_argument("--all-ext", action="store_true", help="连非源码后缀（.md/.txt/无后缀）也摘要")
     dg.set_defaults(fn=cmd_digest)
 
-    d = sub.add_parser("diff", help="最近一次 diff")
+    d = sub.add_parser("diff", allow_abbrev=False, help="最近一次 diff")
     d.add_argument("path")
     d.add_argument("--max-chars", type=int, default=12000)
     d.set_defaults(fn=cmd_diff)
 
-    rs = sub.add_parser("reset", help="清缓存")
+    rs = sub.add_parser("reset", allow_abbrev=False, help="清缓存")
     rs.add_argument("path")
     rs.set_defaults(fn=cmd_reset)
 
-    h = sub.add_parser("hot", help="读得最多的文件")
+    h = sub.add_parser("hot", allow_abbrev=False, help="读得最多的文件")
     h.add_argument("--n", type=int, default=15)
     h.set_defaults(fn=cmd_hot)
 

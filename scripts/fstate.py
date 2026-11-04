@@ -481,6 +481,14 @@ def cmd_read(args: argparse.Namespace) -> int:
         # 没记下任何区间时**不能**说「最近读的范围: 全文」—— 那可能是上次被
         # --max-lines / 单行超长截断后留下的记录，全文从未进过上下文。
         where = f"已记录的区间: {recorded}" if recorded else "尚未有完整区间记录（上次可能被截断）"
+        if changed_vs_cache:
+            # 显式 --mode cached 但磁盘其实变了时说「内容未变（sha1 相同）」是句
+            # 自相矛盾的假话 —— 调用方照着这句就能放心跳过重读。宁可把话说全。
+            print(header)
+            print(f"内容**已变**（磁盘 sha1 与缓存不同），缓存里记的是上一次的内容。"
+                  f"此前已读 {meta.get('read_count')} 次；{where}。")
+            print("需要正文请用 --mode full/range，或 --mode changed 只要差异。")
+            return 0
         hint = (
             f"内容未变（sha1 相同）。此前已读 {meta.get('read_count')} 次；"
             f"{where}。需要正文请用 --mode range/full。"
@@ -489,6 +497,11 @@ def cmd_read(args: argparse.Namespace) -> int:
         print(hint)
         if meta.get("last_edit_range"):
             print(f"上次编辑区间: {meta['last_edit_range'][0]}..{meta['last_edit_range'][1]}")
+        # 磁盘已变却走 cached：什么都没交给调用方，就**不能**记账。
+        # 旧代码在这里照样 _bump，而 _bump 会把 sha1 刷成磁盘的新值 ——
+        # 于是下一次 auto 读会认为「这份新内容已经读过了」，正中本技能要防的坑。
+        if changed_vs_cache:
+            return 0
         _bump(path, meta, disk, lines, enc, mode="cached", rng=None, version=next_version)
         return 0
 
@@ -571,7 +584,11 @@ def _bump(path: Path, meta: dict, disk: str, lines: list[str], enc: str,
     now = time.time()
     ranges = meta.get("read_ranges") or []
     if rng:
-        ranges.append(list(rng))
+        r = list(rng)
+        # 连着读同一段（最常见：全文读两遍）没必要在列表里堆成
+        # [[1,1],[1,1],[1,1]]，那样「已记录的区间」提示会变成一串重复噪音。
+        if not ranges or ranges[-1] != r:
+            ranges.append(r)
     if version is None:
         version = (meta.get("version") or 0)
         if not meta.get("sha1"):

@@ -528,7 +528,17 @@ def cmd_read(args: argparse.Namespace) -> int:
                       "下一次 read 会说「内容未变」，不会再把这段差异给你。]")
             _bump(path, meta, disk, lines, enc, mode="changed", rng=rng, diff=d, version=next_version)
             return 0
-        # 没有影子副本 → 老实给全文
+        # 没有影子副本 → 只能老实给全文。但得说清楚为什么给不了差异：
+        # 否则「我说要 diff，它却甩全文」看起来像没听懂，下次还这么用。
+        if meta.get("sha1") and meta.get("sha1") != disk:
+            if not meta.get("shadow"):
+                why_no_diff = meta.get("shadow_error") or (
+                    "上次读的时候没存成影子副本" if meta.get("shadow") is False else "缓存里没有旧版本快照"
+                )
+            else:
+                why_no_diff = "影子副本读不出来"
+            print(f"# 没有可用的旧版本快照（{why_no_diff}），给不了差异，下面是全文"
+                  f"（超过 {SHADOW_LIMIT // 1024 // 1024} MB 的文件本就不存影子副本）。")
         mode = "full"
 
     if mode == "range":

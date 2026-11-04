@@ -838,6 +838,7 @@ def cmd_digest(args: argparse.Namespace) -> int:
     """一次看多个文件的结构（行数 + 顶层签名 + 缓存状态），替代逐个 read。"""
     targets: list[Path] = []
     skipped: list[Path] = []
+    missing: list[str] = []
     all_ext = bool(getattr(args, "all_ext", False))
     scan_info: dict = {}
     for raw in args.paths:
@@ -850,6 +851,10 @@ def cmd_digest(args: argparse.Namespace) -> int:
                     skipped.append(f)
         elif p.is_file():
             targets.append(p)
+        else:
+            # 以前这种路径既不进 targets 也不进 skipped，就这么消失了，最后只报一句
+            # 「没有可摘要的文件（目录里没有常见源码后缀？）」—— 明明是自己拼错了文件名。
+            missing.append(raw)
     seen = set()
     uniq = []
     for t in targets:
@@ -863,8 +868,14 @@ def cmd_digest(args: argparse.Namespace) -> int:
     uniq = uniq[: args.max_files]
     rest = total_avail - len(uniq)
     if not uniq:
-        print("ERROR: 没有可摘要的文件（目录里没有常见源码后缀？可用 --max-files 放宽）")
+        if missing:
+            print(f"ERROR: 这些路径不存在: {'、'.join(missing)}")
+            print("  拼错了文件名不会得到「没有可摘要的文件」这种误导性提示——这里直接说哪个不存在。")
+        else:
+            print("ERROR: 没有可摘要的文件（目录里没有常见源码后缀？可用 --max-files 放宽）")
         return 2
+    if missing:
+        print(f"# ⚠ 跳过不存在的路径 {len(missing)} 个: {'、'.join(missing)}")
 
     if rest > 0:
         print(f"# 结构摘要  {total_avail} 个文件中的前 {len(uniq)} 个"

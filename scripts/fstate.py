@@ -180,14 +180,18 @@ def _session_id() -> str:
     于是 `read` 会回一句「内容未变」把正文永久挡在门外 —— 这正是本工具要消灭的失败模式，
     却由它自己制造。
 
-    DSH 会给 bash 工具注入 `DSH_SESSION_ID`，有就用它；没有就退回到父进程 pid，
-    再没有就返回空串（空串时按保守策略处理：不当作同一会话）。
+    DSH 会给 bash 工具注入 `DSH_SESSION_ID`，有就用它。
+
+    拿不到就返回空串 —— 而空串在调用方那里**必须**被当成「不是同一会话」（保守 =
+    重新给正文）。这条纪律曾经写反过：`same_session` 里有个 `or (not sess)`，
+    于是「拿不到会话标识」反而变成了「无条件算同一会话」，跟这里的承诺正好相反。
+    实测去掉 `DSH_SESSION_ID` 后，`read` 照样回「内容未变…本会话已完整交付过」。
+
+    注意 `os.environ.get("PPID")` 是拿不到的：PPID 是 shell 的内建变量，不导出到
+    子进程的环境里。所以只剩一级，别再写 `pid-{PPID}` 这种永远走不到的分支，
+    那只会让人以为还有一层兜底。
     """
-    sid = os.environ.get("DSH_SESSION_ID") or os.environ.get("SESSION_ID") or ""
-    if sid:
-        return sid.strip()
-    ppid = os.environ.get("PPID") or ""
-    return f"pid-{ppid}" if ppid else ""
+    return (os.environ.get("DSH_SESSION_ID") or "").strip()
 
 
 
@@ -253,14 +257,43 @@ def _meta_sane(m: object) -> tuple[bool, str]:
     """
     if not isinstance(m, dict):
         return False, f"顶层不是对象（是 {type(m).__name__}）"
+    # bool 是 int 的子类：`isinstance(True, int)` 为真，于是 `{"version": true}`
+    # 能过校验，接着 `v{version}` 打出「版本 vTrue」、`full_version == version`
+    # 也成立（True == 1），凭证被伪造出来。整数就用整数，别用真假值。
     for k in ("version", "read_count", "lines"):
-        if k in m and not isinstance(m[k], int):
+        if k in m and m[k] is not None and (isinstance(m[k], bool) or not isinstance(m[k], int)):
             return False, f"字段 {k} 不是整数"
+    for k in ("full_version",):
+        if k in m and m[k] is not None and (isinstance(m[k], bool) or not isinstance(m[k], int)):
+            return False, f"字段 {k} 不是整数"
+    # last_read_at / mtime 存的是 time.time()，**浮点**。把它们也要求成 int，
+    # 结果是每一条刚写下的缓存都在下次读取时被判「损坏并丢弃」——
+    # 凭证当场失效，而报错理由是「字段 last_read_at 不是整数」，跟真相完全对不上。
+    for k in ("last_read_at", "mtime"):
+        if k in m and m[k] is not None and (
+            isinstance(m[k], bool) or not isinstance(m[k], (int, float))
+        ):
+            return False, f"字段 {k} 不是数字"
     for k in ("read_ranges", "last_edit_range"):
         if k in m and m[k] is not None and not isinstance(m[k], list):
             return False, f"字段 {k} 不是列表"
     if "path" in m and not isinstance(m["path"], str):
         return False, "字段 path 不是字符串"
+    # 区间只校验**结构**，不校验越界。
+    # 「文件被外部改短」是正常事件（100 行的文件被改成 5 行），旧区间 1..100 自然越界，
+    # 那不是缓存坏了。早先这里把越界也判成损坏，于是每次外部改短都会把整条记录丢掉：
+    # 版本号回退成 v1、区间照旧显示 1..100，而且 state 会嘴硬说「缓存条目已损坏」。
+    # 越界项在 `_bump` 与 `cmd_state` 里按当前行数裁剪即可。
+    lines = m.get("lines")
+    bad_ranges = list(m.get("read_ranges") or [])
+    if m.get("last_edit_range"):
+        bad_ranges.append(m["last_edit_range"])
+    for r in bad_ranges:
+        if not (isinstance(r, list) and len(r) == 2):
+            return False, "区间不是 [起, 止] 两个整数"
+        for x in r:
+            if isinstance(x, bool) or not isinstance(x, int):
+                return False, "区间端点不是整数"
     return True, ""
 
 
@@ -737,7 +770,11 @@ def cmd_read(args: argparse.Namespace) -> int:
     )
     # 账本是磁盘级的、持久化的；「正文在上下文里」是对话级的、会随会话结束和
     # 上下文压缩蒸发。两者作用域不同，所以必须记下交付时是哪个会话。
-    same_session = (not meta.get("session")) or (not sess) or meta.get("session") == sess
+    # 拿不到会话标识（空串）时按**保守**处理：不算同一会话，重新给正文。
+    # 以前这里写的是 `(not meta.get("session")) or (not sess) or ...`，两个「缺值」
+    # 都被当成「相等」—— 结果是最该保守的场合反而最宽松（实测：清掉
+    # DSH_SESSION_ID 后仍然回「内容未变」）。缺值只有一种安全的解释方式。
+    same_session = bool(sess) and meta.get("session") == sess
 
     if mode == "auto":
         # 显式给了行范围就是想要局部正文，别拿「内容未变」把请求挡回去
@@ -795,7 +832,13 @@ def cmd_read(args: argparse.Namespace) -> int:
         # 显式要「只要差异」，但磁盘压根没变。以前这里静默落到全文分支，
         # 于是一句「给我差异」换来一整篇正文 + 账本记成已读全文。
         print(header)
-        print("磁盘内容与上次读时相同，没有差异。要正文请用 --mode full/range。")
+        if not meta.get("sha1"):
+            # 「没变」的前提是「以前看过」。从没读过的时候一个基准都没有，
+            # 说「与上次读时相同」是拿不存在的东西当参照物。
+            print("还没有这份文件的任何记录（从没读过），没有基准可比。"
+                  "要正文请用 --mode full/range。")
+        else:
+            print("磁盘内容与上次读时相同，没有差异。要正文请用 --mode full/range。")
         return 0
 
     if mode == "diff":
@@ -807,8 +850,19 @@ def cmd_read(args: argparse.Namespace) -> int:
             return 0
         d = unified(old_lines, lines, rel)
         if not d.strip():
-            print(f"# 行内容没有变化（版本 v{meta.get('version', 0)}，{total} 行）。"
-                  f"字节层可能变了（换行/BOM/编码），用 diff 看不了这个。")
+            # 「没有行级差异」有两种完全不同的原因，以前一律说成后者：
+            # ① 刚用本脚本 edit/write 过 —— 那时影子副本已经被同步成新内容，
+            #    拿它比磁盘自然一模一样。这是**正常的**，却被说成「字节层可能变了」，
+            #    等于把「我自己的写入覆盖了基准」栽赃给文件的换行/BOM/编码。
+            # ② 读完之后磁盘确实没变，只有字节层（换行/BOM/编码）动了。
+            if not changed_vs_cache and meta.get("last_edit_at"):
+                print(f"# 行内容没有变化（版本 v{meta.get('version', 0)}，{total} 行）。")
+                print("  缓存里的基准已同步成当前内容（上次是本脚本自己的 edit/write 改的），"
+                      "所以比不出差异。")
+                print(f"  那次改了什么用: fstate.py diff {args.path}")
+            else:
+                print(f"# 行内容没有变化（版本 v{meta.get('version', 0)}，{total} 行）。"
+                      f"字节层可能变了（换行/BOM/编码），用 diff 看不了这个。")
             return 0
         print(header)
         print(f"## 与上次读到的版本（v{meta.get('version', 0)}）的差异：\n")
@@ -914,6 +968,17 @@ def _bump(path: Path, meta: dict, disk: str, lines: list[str], enc: str,
         # [[1,1],[1,1],[1,1]]，那样「已记录的区间」提示会变成一串重复噪音。
         if not ranges or ranges[-1] != r:
             ranges.append(r)
+    # 区间按当前行数裁剪：文件被外部改短时，旧区间（比如 100 行文件记下的 1..100）
+    # 会一路显示成「历史读过 1..100」，而文件现在只有 5 行 —— 那是凭空造出来的行号。
+    n_now = len(lines)
+    clipped: list[list[int]] = []
+    for r in ranges:
+        if not (isinstance(r, list) and len(r) == 2):
+            continue
+        a, b = max(1, int(r[0])), min(n_now, int(r[1]))
+        if a <= b:
+            clipped.append([a, b])
+    ranges = clipped
     if version is None:
         version = (meta.get("version") or 0)
         if not meta.get("sha1"):
@@ -1169,8 +1234,10 @@ def cmd_write(args: argparse.Namespace) -> int:
     # 「来源给了、但内容为空」曾经是一条无声的毁文件通道：`write g.txt --stdin < /dev/null`
     # 把 2 行重要内容清成 0 字节、rc=0、还正常打了 diff —— 无人值守时漏一根管道就中招。
     # 空内容只能由「原来就是空的」或显式 --allow-empty 允许。
-    if not body and not args.allow_empty and existed and original is not None and original.text.strip():
-        print(f"ERROR: 新内容是空的（0 字节），而 {path.name} 现在有 {len(old_lines)} 行。")
+    # 判据是「原文件有没有字节」，不是 `strip()`：一个只有三行空白的文件被清成 0 字节，
+    # 在 `strip()` 看来「本来就没内容」，可那 3 个字节是用户在磁盘上的东西。
+    if not body and not args.allow_empty and existed and original is not None and original.text:
+        print(f"ERROR: 新内容是空的（0 字节），而 {path.name} 现在有 {len(old_lines)} 行（{len(original.text)} 字符）。")
         print("  文件没被改动。确实要清空请加 --allow-empty。"
               "（如果是管道/临时文件没拿到内容，先检查来源。）")
         return 2
@@ -1233,7 +1300,12 @@ def cmd_write(args: argparse.Namespace) -> int:
     if original is not None:
         original_had_eol = original.text.endswith(("\n", "\r"))
     else:
-        original_had_eol = True
+        # 新文件：**不要**凭空补末尾换行。以前这里写死 True，于是
+        # `write n.txt --content-file b.txt`（b.txt 是 `abc` 没有换行）会写出
+        # `abc\n` —— 调用方给的是 3 个字节，落盘成了 4 个，而且 rc=0 不说。
+        # 「新文件默认该有末尾换行」是一种风格偏好，不是事实；
+        # 调用方没说的，就保持调用方给的。
+        original_had_eol = body.endswith(("\n", "\r"))
     if original_had_eol and target_nl and body and not body.endswith(("\n", "\r")):
         body += target_nl
 
@@ -1245,6 +1317,18 @@ def cmd_write(args: argparse.Namespace) -> int:
         print(f"ERROR: 内容无法用 {codec} 编码：{exc}")
         print("  文件没被改动。换编码请加 --encoding utf-8")
         return 2
+    # 内容与磁盘上逐字节相同时，就是「没改」。以前照写不误：版本号 +1、
+    # 缓存凭证作废、还打一行「已改 → v2」—— 一次什么都没改的调用却让下一个
+    # read 多给一遍全文，而调用方以为自己在做幂等操作。
+    if existed:
+        try:
+            if path.read_bytes() == payload:
+                _prev = _load_meta(path)
+                print(f"# 没变化：{path.name} 的字节和你给的内容完全一致，"
+                      f"原样未动（缓存版本未变 v{_prev.get('version') or 0}）")
+                return 0
+        except OSError:
+            pass
     try:
         _atomic_write(path, payload)
     except OSError as exc:
@@ -1443,12 +1527,23 @@ def cmd_state(args: argparse.Namespace) -> int:
         stale = "STALE（磁盘已变，需要 --mode full 重新加载）"
     else:
         stale = "fresh"
+    # 区间按当前行数裁剪，口径与 `_bump`/`read` 保持一致：
+    # 文件被改短后旧区间会越界，直接照抄「1..999」是凭空造出来的行号。
+    _n = meta.get("lines") or 0
+    _rr: list[list[int]] = []
+    for _r in (meta.get("read_ranges") or []):
+        if isinstance(_r, list) and len(_r) == 2:
+            _a, _b = max(1, int(_r[0])), min(_n, int(_r[1])) if _n else int(_r[1])
+            if _a <= _b:
+                _rr.append([_a, _b])
     print(json.dumps({
         "path": meta.get("path"),
         "version": meta.get("version"),
         "lines": meta.get("lines"),
         "read_count": meta.get("read_count"),
-        "read_ranges": meta.get("read_ranges"),
+        "read_ranges": _rr,
+        # 原始区间（未裁剪）。两者不同就说明文件被改短过，行号已经不能直接对上了。
+        "read_ranges_raw": meta.get("read_ranges"),
         # 「读过全文」的凭证是否还有效（版本没变 + 同一会话）。
         # 以前 state 只有 fresh/STALE/MISSING 三态，把「只读过第 5..10 行」的
         # 文件也报成 fresh —— 看起来像「这个文件我已经掌握了」。
@@ -1456,7 +1551,8 @@ def cmd_state(args: argparse.Namespace) -> int:
         "full_read_valid": (
             meta.get("full_version") is not None
             and meta.get("full_version") == meta.get("version")
-            and ((not meta.get("session")) or (not _session_id()) or meta.get("session") == _session_id())
+            and bool(_session_id())
+            and meta.get("session") == _session_id()
         ),
         "session": meta.get("session"),
         "last_edit_range": meta.get("last_edit_range"),
@@ -1516,10 +1612,35 @@ def cmd_hot(args: argparse.Namespace) -> int:
                 continue
             rows.append((m.get("read_count", 0), m.get("path", "?"), m.get("lines", 0)))
     rows.sort(reverse=True)
+
+    def _spill_line() -> str:
+        """溢出文件（被 --max-chars 截断时落盘的全文）只增不减：
+        reset 按路径删、只动 .json 与 .shadow，碰不到 spill/ 目录。
+        不数出来，这里会一直涨，而且「我明明 reset 过了」还清不掉。"""
+        spill_dir = CACHE_HOME / "spill"
+        if not spill_dir.is_dir():
+            return ""
+        n = 0
+        size = 0
+        for f in spill_dir.iterdir():
+            if f.is_file():
+                n += 1
+                try:
+                    size += f.stat().st_size
+                except OSError:
+                    pass
+        if not n:
+            return ""
+        return (f"#  共 {n} 个溢出文件（被截断的全文落盘），占 {size / 1024:.0f} KB：{spill_dir}\n"
+                f"   只有补看被截掉的内容时才用得上；reset 不会清这里，要收回空间就手动删。")
+
     if not rows:
         print("缓存里还没有记录（还没用 fstate read 过任何文件）")
         if orphan_shadows:
             print(f"# ⚠ 但有 {orphan_shadows} 个孤儿影子副本（没有对应 .json），占着磁盘")
+        tail = _spill_line()
+        if tail:
+            print(tail)
         return 0
     print("读次数  行数   文件")
     for c, p, n in rows[: args.n]:
@@ -1530,6 +1651,12 @@ def cmd_hot(args: argparse.Namespace) -> int:
     if orphan_shadows:
         print(f"# ⚠ 另有 {orphan_shadows} 个孤儿影子副本（对应的 .json 已不在），"
               f"没有任何命令会清理它们；要收回空间就手动删 {CACHE_HOME}")
+    # 溢出文件（被 --max-chars 截断时落盘的全文）同样是只增不减的：
+    # reset 按路径删、只动 .json 与 .shadow，碰不到 spill/ 目录。
+    # 不数出来，这里会一直涨，而且「我明明 reset 过了」还清不掉。
+    tail = _spill_line()
+    if tail:
+        print(tail)
     return 0
 
 

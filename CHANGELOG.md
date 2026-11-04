@@ -63,11 +63,25 @@
 - `explore` 的 `skipped_bundle` 计数器只加不读，打包产物被静默跳过——现在明说「另有 N 个文件因含超长行被跳过」。
 - 所有子命令的 `-h` 之前只有参数名、零说明（而 `SKILL.md` 说用 `--help` 看全部参数）——补齐 `help=` 文案。
 
+### 七、收尾自查（5 个复查评审员全部运行失败，这一批由我自己攻击得出）
+
+- **新建文件被凭空补末尾换行**：`write n.txt --content-file b.txt`（`b.txt` 是 `abc`，没有换行）落盘成 `abc\n`——调用方给 3 个字节，写出去 4 个，rc=0 不说。根因是 `original_had_eol` 在无原文件时写死 `True`。「新文件默认该有末尾换行」是风格偏好不是事实，调用方没说的就保持调用方给的。现在 `abc` 就是 `abc`。
+- **`write` 用同样的内容重写也「已改 → v2」**：版本号 +1、凭证作废、还打一行 diff 为空——一次什么都没改的调用却让下一个 `read` 多给一遍全文，调用方以为自己在做幂等操作。现在先比字节，相同就 `# 没变化：… 原样未动（缓存版本未变 v1）` 直接返回，不写盘不 bump。
+- **`_session_id()` 的两处谎言**：`os.environ.get("PPID")` 拿不到（PPID 是 shell 内建变量，不导出给子进程），`pid-{PPID}` 是永远走不到的死分支；更糟的是 `same_session = (not meta["session"]) or (not sess) or ...` 把两个「缺值」都当成「相等」，拿不到会话标识时反而最宽松——`env -u DSH_SESSION_ID` 实测仍回「内容未变」。现在 `same_session = bool(sess) and meta["session"] == sess`，缺标识按保守处理给正文。
+- **`_meta_sane` 的 bool 绕过**：`isinstance(True, int)` 为真，于是把缓存里 `version`/`full_version` 改成 `true` 能过校验，`True == 1` 让凭证被伪造、还打出「版本 vTrue」。现在这几个字段显式排除 bool。
+- **`_meta_sane` 自己造成的两次回归**（一并修）：① 把 `last_read_at`（`time.time()` 浮点）当整数校验，导致每条刚写的缓存立刻被判损坏 unlink、凭证当场失效，`state` 还嘴硬说「字段 last_read_at 不是整数」；② 越界区间校验误伤正常场景——「文件被外部改短」不是缓存损坏，却让整条记录被丢、版本回退。现在只校验区间结构，越界交给 `_bump` 按当前行数裁剪，`state` 同时给 `read_ranges`（裁后）与 `read_ranges_raw`（原始），两者不同就说明文件变短过。
+- **`--mode changed` 对从未读过的文件说「磁盘内容与上次读时相同」**：拿不存在的基准当参照物。现在明说「还没有这份文件的任何记录，没有基准可比」。
+- **`--mode diff` 把「我刚 edit 过」栽赃给文件编码**：影子已被自己的写入同步成新内容，比不出差异属正常，却报「字节层可能变了（换行/BOM/编码）」。现在先判 `last_edit_at`，指向 `fstate.py diff` 回想那次改了什么。
+- **`hot` 从不报告 spill 目录**：溢出文件只增不减、`reset` 清不到，磁盘上越堆越多而没人知道。现在 `hot` 统计并明说「reset 不会清这里」。
+
 ### 回归
 
 - `/c/tmp/fst/regress3.sh` 32 项全 PASS
 - `/c/tmp/fst/v110.sh` 24 项全 PASS（凭证/截断/字节层/编码）
 - `/c/tmp/fst/v111.sh` 28 项全 PASS（空输入/链接/读侧异常/坏缓存/msys 路径）
+- `/c/tmp/final/final.py` 20 项全 PASS（stdin 字节保真 / 新建文件末尾换行 / write 幂等 / 凭证四况 / 11 类文件 write 原样字节保真）
+- `/c/tmp/mtx/matrix.py` 18 类文件 × read/edit/write = 54 项全 PASS（UTF-8/CRLF/BOM/UTF-16-LE·BE/UTF-32-LE·BE/GBK/Latin-1/混合换行/空/仅 BOM/仅换行/无末尾换行/BOM+CRLF/CR-only）
+- `/c/tmp/atk2/atk2.py` 15 项全 PASS（stdin 各种输入 / 1MB 单行 / explore 120 文件与截断 / --label 特殊字符 / UTF-16 行号定位 / 混合换行 / write 幂等）
 
 ## 1.0.8 — 2026-11-04
 

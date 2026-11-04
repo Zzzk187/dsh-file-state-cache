@@ -973,16 +973,28 @@ def cmd_diff(args: argparse.Namespace) -> int:
 
 def cmd_reset(args: argparse.Namespace) -> int:
     path = resolve_input(args.path)
+    removed = 0
     for p in (_meta_path(path), _shadow_path(path)):
         if p.is_file():
             p.unlink()
-    print(f"已清缓存: {path}")
+            removed += 1
+    if removed:
+        print(f"已清缓存: {path}")
+    else:
+        # 以前不管有没有都回「已清缓存」，于是「我明明清过了」变成一个无法证伪的说法。
+        print(f"没有缓存可清: {path}（本来就没 read/edit 过）")
     return 0
 
 
 def cmd_hot(args: argparse.Namespace) -> int:
     rows = []
+    orphan_shadows = 0
     if CACHE_HOME.is_dir():
+        known = {f.stem for f in CACHE_HOME.glob("*.json")}
+        # 影子副本没有对应的 .json 时永远不会有命令去碰它 ——
+        # reset 是按路径删的，json 都没了就没人记得这个 shadow 属于谁。
+        # 不数出来，这些文件会安静地占着磁盘直到手动翻目录。
+        orphan_shadows = sum(1 for f in CACHE_HOME.glob("*.shadow") if f.stem not in known)
         for f in CACHE_HOME.glob("*.json"):
             try:
                 m = json.loads(f.read_text(encoding="utf-8"))
@@ -992,6 +1004,8 @@ def cmd_hot(args: argparse.Namespace) -> int:
     rows.sort(reverse=True)
     if not rows:
         print("缓存里还没有记录（还没用 fstate read 过任何文件）")
+        if orphan_shadows:
+            print(f"# ⚠ 但有 {orphan_shadows} 个孤儿影子副本（没有对应 .json），占着磁盘")
         return 0
     print("读次数  行数   文件")
     for c, p, n in rows[: args.n]:
@@ -999,6 +1013,9 @@ def cmd_hot(args: argparse.Namespace) -> int:
         print(f"{c:6d}  {n:5d}   {p}{flag}")
     if len(rows) > args.n:
         print(f"（共 {len(rows)} 个文件有缓存记录，只显示前 {args.n} 个；看全部加 --n {len(rows)}）")
+    if orphan_shadows:
+        print(f"# ⚠ 另有 {orphan_shadows} 个孤儿影子副本（对应的 .json 已不在），"
+              f"没有任何命令会清理它们；要收回空间就手动删 {CACHE_HOME}")
     return 0
 
 

@@ -1,6 +1,6 @@
 {
   "name": "dsh-file-state-cache",
-  "version": "1.0.7",
+  "version": "1.0.8",
   "description": "File-state cache skill for DeepSeek Harness: one exploration call instead of ls+grep+read, reads that remember they already happened, and edits that return a diff instead of forcing a full re-read. State lives on disk, so it survives across tool calls, turns and restarts — a plain tool cannot do that.",
   "keywords": [
     "deepseek-harness",

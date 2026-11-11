@@ -22,16 +22,24 @@ from __future__ import annotations
 
 import argparse
 import codecs
+import contextlib
 import difflib
+import glob
 import math
 import hashlib
 import json
 import os
 import re
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+
+if os.name == "nt":  # pragma: no cover - 平台分支
+    import msvcrt
+else:  # pragma: no cover - 平台分支
+    import fcntl
 
 # ---------------------------------------------------------------- 基础设施
 
@@ -75,6 +83,23 @@ def _positive_int(raw: str) -> int:
     return val
 
 
+def _finite_float(raw: str) -> float:
+    """argparse 的 type 校验：`--min-score` 必须是有限数字。
+
+    裸 `type=float` 会接受 nan/inf。nan 让 `score < nan` 恒为 False —— 等于门槛
+    失效，所有命中全列（输出灌水）；inf 则把所有命中滤光却不告诉你是参数害的。
+    这两个值都不是「分数」，明确拒掉比悄悄换一个默认值诚实。
+    """
+    try:
+        val = float(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"得是数字，收到 {raw!r}") from None
+    if not math.isfinite(val):
+        raise argparse.ArgumentTypeError(
+            f"--min-score 得是有限数字，收到 {raw!r}（nan/inf 会让分数过滤失效）")
+    return val
+
+
 def _read_stdin_text() -> str:
     """读 stdin 的全部文本。
 
@@ -93,7 +118,13 @@ def _read_stdin_text() -> str:
             return raw.decode(enc)
         except UnicodeDecodeError:
             continue
-    return raw.decode("utf-8", errors="replace")
+    # 以前这里 `errors="replace"` 把解不出来的字节换成 U+FFFD 悄悄写进用户文件 ——
+    # 一次管道里的编码事故就这样变成永久损坏，而且 rc=0 看不出任何异常。
+    # 宁可拒绝写入，也不能静默改掉内容。
+    raise _StdinDecodeError(
+        "stdin 里有解不出来的非法字节（既不是 UTF-8 也不是 GBK），"
+        "拒绝用替换字符悄悄写进文件。请用 --content-file 传文件，"
+        "或先把内容转成 UTF-8/GBK 文本。")
 
 
 def _read_piece(file_arg: str, inline: str, flag: str) -> tuple[str, str]:
@@ -119,12 +150,19 @@ def _read_piece(file_arg: str, inline: str, flag: str) -> tuple[str, str]:
     # 报错信息里一直写着「不是 UTF-8/GBK 文本」，但实现只试过 utf-8-sig ——
     # 于是 GBK 片段会被判成读不了，而同字节走 --stdin 却能正确解码。
     # 声明了什么就得真做什么：utf-8-sig（顺手剥 BOM）→ gbk → latin-1，与 load() 同序。
-    for enc in ("utf-8-sig", "gbk"):
+    # UTF-16/32 BOM 片段：codecs 能认，别因为不在列表里就拒绝 --old-file。
+    for bom, enc in BOM_TABLE:
+        if raw.startswith(bom):
+            try:
+                return raw[len(bom):].decode(enc), ""
+            except UnicodeDecodeError:
+                break
+    for enc in ("utf-8-sig", "gbk", "latin-1"):
         try:
             return raw.decode(enc), ""
         except UnicodeDecodeError:
             continue
-    return "", f"ERROR: {flag} 不是 UTF-8/GBK 文本: {file_arg}"
+    return "", f"ERROR: {flag} 不是可识别的文本: {file_arg}"
 
 
 SKIP_DIRS = {
@@ -201,7 +239,10 @@ def _session_id() -> str:
 
 
 def _key(path: Path) -> str:
-    return hashlib.sha1(str(path.resolve()).lower().encode("utf-8")).hexdigest()[:20]
+    # normcase：Windows 上折叠大小写（大小写不敏感 FS 的正确语义），POSIX 上
+    # 保持原样 —— 那里 Foo.py 与 foo.py 是两个文件，无条件 .lower() 会让它们
+    # 共用一条缓存，B 文件会读到 A 的内容还被告知「内容未变」。
+    return hashlib.sha1(os.path.normcase(str(path.resolve())).encode("utf-8")).hexdigest()[:20]
 
 
 def def_boost(low: str, terms: list[str]) -> int:
@@ -246,6 +287,136 @@ def _meta_path(path: Path) -> Path:
 
 def _shadow_path(path: Path) -> Path:
     return CACHE_HOME / f"{_key(path)}.shadow"
+
+
+def _lock_path(path: Path) -> Path:
+    return CACHE_HOME / f"{_key(path)}.lock"
+
+
+class _SpillError(OSError):
+    """溢出文件落盘失败：正文既没打印也没落盘，必须明确报错，不能静默丢内容。"""
+
+
+class _StdinDecodeError(OSError):
+    """stdin 含非法字节：拒绝用替换字符把损坏内容悄悄写进用户文件。"""
+
+
+def _atomic_cache_write(target: Path, data: bytes) -> None:
+    """原子地写一个缓存文件（{key}.json / {key}.shadow）。
+
+    直接 write_text 有两个 P0 问题：写到一半被打断会留下半截 JSON/影子副本；
+    两个进程同时写会互相覆盖成混合内容。同目录临时文件 + fsync + os.replace
+    让「要么整份旧的、要么整份新的」成立，且不需要 Redis/数据库这类外部依赖。
+    """
+    CACHE_HOME.mkdir(parents=True, exist_ok=True)
+    # 顺手清掉超过一小时的崩溃残留（正常用完就被 replace 掉了）。
+    try:
+        now = time.time()
+        pattern = glob.escape(target.name) + ".fstate-tmp*"
+        for old_tmp in CACHE_HOME.glob(pattern):
+            try:
+                if now - old_tmp.stat().st_mtime > 3600:
+                    old_tmp.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
+    tmp = CACHE_HOME / f"{target.name}.fstate-tmp-{os.getpid()}-{os.urandom(3).hex()}"
+    try:
+        with open(tmp, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        for attempt in range(6):
+            try:
+                os.replace(tmp, target)
+                break
+            except PermissionError:
+                if attempt == 5:
+                    raise
+                time.sleep(0.02 * (attempt + 1))
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+# 同进程内多线程也要串行（多进程靠下面的 OS 文件锁）。按 key 一把 RLock，
+# 不同文件互不阻塞。
+_INPROC_LOCKS: dict[str, threading.RLock] = {}
+_INPROC_GUARD = threading.Lock()
+
+
+def _inproc_lock(key: str) -> threading.RLock:
+    with _INPROC_GUARD:
+        lk = _INPROC_LOCKS.get(key)
+        if lk is None:
+            lk = threading.RLock()
+            _INPROC_LOCKS[key] = lk
+        return lk
+
+
+@contextlib.contextmanager
+def _cache_lock(path: Path):
+    """per-file 轻量文件锁，只包住 edit/write 的「读→写→更新缓存」临界区。
+
+    · 进程内：threading.RLock（同一进程的多线程编辑串行）。
+    · 跨进程：POSIX 用 fcntl.flock，Windows 用 msvcrt.locking（锁 1 字节）。
+      两者都由 OS 在进程退出时自动释放 —— 崩溃/kill 不会留下死锁。
+    · 拿不到锁（缓存目录不可访问等）不能阻断写文件：明确打印警告后降级为
+      「只靠进程内锁」，绝不静默。
+    """
+    key = _key(path)
+    inproc = _inproc_lock(key)
+    inproc.acquire()
+    fh = None
+    locked = False
+    try:
+        try:
+            CACHE_HOME.mkdir(parents=True, exist_ok=True)
+            lp = _lock_path(path)
+            fh = open(lp, "a+b")
+            fh.seek(0, 2)
+            if fh.tell() == 0:
+                fh.write(b"\0")
+                fh.flush()
+            fh.seek(0)
+            if os.name == "nt":
+                deadline = time.time() + 30
+                while True:
+                    try:
+                        msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                        locked = True
+                        break
+                    except OSError:
+                        if time.time() >= deadline:
+                            raise
+                        time.sleep(0.02)
+            else:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+                locked = True
+        except OSError as exc:
+            print(f"# ⚠ 缓存锁拿不到（{exc.strerror or exc}），本次写入没有跨进程锁；"
+                  f"并行编辑同一文件可能互相覆盖，请留意。")
+        yield
+    finally:
+        if fh is not None:
+            try:
+                if locked:
+                    fh.seek(0)
+                    if os.name == "nt":
+                        msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                fh.close()
+            except OSError:
+                pass
+        inproc.release()
 
 
 _LAST_META_BAD = ""
@@ -312,6 +483,13 @@ def _load_meta(path: Path) -> dict:
         m = json.loads(p.read_text(encoding="utf-8"))
     except Exception as exc:
         _LAST_META_BAD = f"读不出来（{type(exc).__name__}）"
+        # 语法损坏的条目留着只会让之后每一次 read/edit/state/hot 都重新解析一遍、
+        # 反复当「从没读过」重发全文（cmd_state 还嘴硬说「已丢弃」）。直接删掉，
+        # 让本次读取以「首次读」重建缓存 —— 这是能安全自动恢复的情形。
+        try:
+            p.unlink()
+        except OSError:
+            pass
         return {}
     ok, why = _meta_sane(m)
     if not ok:
@@ -336,15 +514,16 @@ def _save_meta(path: Path, meta: dict) -> None:
     而它其实早就拿到全文了。所以：写不成就写不成，安静地降级。
     """
     try:
-        CACHE_HOME.mkdir(parents=True, exist_ok=True)
-        _meta_path(path).write_text(json.dumps(meta, ensure_ascii=False, indent=1),
-                                    encoding="utf-8")
-    except OSError as exc:
+        blob = json.dumps(meta, ensure_ascii=False, indent=1).encode("utf-8")
+        _atomic_cache_write(_meta_path(path), blob)
+    except (OSError, TypeError, ValueError) as exc:
         # 只提示一次，且明确说「正文没问题」——否则这行警告本身就成了新的困惑源。
+        # json.dumps 的 TypeError/ValueError 也要收口：以前它们会裸栈 rc=1，
+        # 而正文其实早就正常打印了。
         global _CACHE_WRITE_FAILED
         if not _CACHE_WRITE_FAILED:
             _CACHE_WRITE_FAILED = True
-            print(f"# 缓存写不进去（{exc.strerror or exc}）: {CACHE_HOME}")
+            print(f"# 缓存写不进去（{getattr(exc, 'strerror', None) or exc}）: {CACHE_HOME}")
             print("# 不影响这次输出，只是这次读不会被记住（下次还会重新给你正文）。")
 
 
@@ -423,16 +602,34 @@ class TextFile:
         return self.bom + text.encode(self.encoding)
 
 
-def load(path: Path) -> tuple[TextFile | None, str]:
-    """读文件并判定编码/换行；不可读返回 (None, 原因)。
+def _looks_binary(raw: bytes, text: str) -> bool:
+    """无 BOM 文件是不是二进制。
 
-    探测顺序：**先认真的 BOM**，没有 BOM 才谈回退。这是 1.0.5 的核心修复 ——
-    用 utf-8-sig 当探测器会把「无 BOM 的 UTF-8」谎报成「有 BOM」，写回就多出三个字节。
+    以前只查 `raw[:8192]` 里有没有 NUL，而且 FALLBACK_ENCODINGS 里 latin-1 是
+    万能兜底（0x00-0xFF 一对一，永不抛 UnicodeDecodeError）—— 于是「前 8K 无 NUL
+    的二进制」「无 NUL 但满是控制字节的二进制」都会被当文本读进来，接着被 edit
+    的 split_lines / write 的换行归一改写 0x0D/0x0A 字节，悄悄损坏用户的文件。
+
+    现在：全文任意位置有 NUL 即二进制；解码后非打印控制字符（排除 \t\n\r\f\v）
+    占比超过 0.5% 也是二进制。正常源码/中文/合法 latin-1 西欧文本几乎不含 C0
+    控制字符，不会被误杀。UTF-16/32 走 BOM 候选，不进这里。
     """
-    if path.stat().st_size > 8 * 1024 * 1024:
-        return None, "toolarge"
-    raw = path.read_bytes()
+    if b"\x00" in raw:
+        return True
+    if text:
+        bad = sum(1 for ch in text if ord(ch) < 32 and ch not in "\t\n\r\f\v")
+        if bad / len(text) > 0.005:
+            return True
+    return False
 
+
+def _decode_bytes(raw: bytes) -> tuple[TextFile | None, str]:
+    """把一份**已经读进内存的字节**解码成 TextFile，并判定是不是二进制。
+
+    与 load() 分开是为了让 cmd_read/cmd_edit/cmd_write 能「一次读字节、既算 sha1
+    又解出正文」—— 消除 sha1_of → load → stat 三次独立读之间的 TOCTOU：那三次
+    读之间若文件被外部改动，缓存里记的 sha1 和真正交付给 Agent 的正文就不是同一份。
+    """
     # BOM 只能决定**候选**解码器，不能一命中就定论。UTF-32-LE 的 BOM（ff fe 00 00）
     # 是 UTF-16-LE BOM（ff fe）的超集：一个正文以 U+0000 开头的合法 UTF-16-LE 文件
     # 会被误认成 UTF-32-LE，解码失败后被判成 binary 并从此读不出来 —— 而它完全合法。
@@ -440,16 +637,15 @@ def load(path: Path) -> tuple[TextFile | None, str]:
     candidates = [(marker, name) for marker, name in BOM_TABLE if raw.startswith(marker)]
 
     if not candidates:
-        # 只有「无 BOM」的文件才用 NUL 判二进制；UTF-16/32 正文里满是 NUL，
-        # 但它们已经被上面的候选认领走了。
-        if b"\x00" in raw[:8192]:
-            return None, "binary"
         for name in FALLBACK_ENCODINGS:
             try:
-                return TextFile(text=raw.decode(name), encoding=name, bom=b""), ""
+                text = raw.decode(name)
             except UnicodeDecodeError:
                 continue
-        return None, "unknown"
+            if _looks_binary(raw, text):
+                return None, "binary"
+            return TextFile(text=text, encoding=name, bom=b""), ""
+        return None, "binary"
 
     last_err = "unknown"
     for bom, codec in candidates:
@@ -459,6 +655,29 @@ def load(path: Path) -> tuple[TextFile | None, str]:
             last_err = f"binary({codec})"
             continue
     return None, last_err
+
+
+def _read_once(path: Path) -> tuple[bytes, TextFile | None, str]:
+    """一次 stat + 一次 read_bytes。返回 (原始字节, 解码结果, 原因)。
+
+    调用方用 `hashlib.sha1(raw).hexdigest()` 算 disk，就能保证「记进缓存的
+    sha1」和「这次交付的正文」严格来自同一次读取。
+    """
+    if path.stat().st_size > 8 * 1024 * 1024:
+        return b"", None, "toolarge"
+    raw = path.read_bytes()
+    tf, why = _decode_bytes(raw)
+    return raw, tf, why
+
+
+def load(path: Path) -> tuple[TextFile | None, str]:
+    """读文件并判定编码/换行；不可读返回 (None, 原因)。
+
+    探测顺序：**先认真的 BOM**，没有 BOM 才谈回退。这是 1.0.5 的核心修复 ——
+    用 utf-8-sig 当探测器会把「无 BOM 的 UTF-8」谎报成「有 BOM」，写回就多出三个字节。
+    """
+    _raw, tf, why = _read_once(path)
+    return tf, why
 
 
 def _broken_link_hint(path: Path) -> str:
@@ -522,11 +741,32 @@ def _atomic_write(path: Path, data: bytes) -> None:
     except OSError:
         linked = False
     if linked:
-        with open(path, "r+b") as fh:
-            fh.write(data)
-            fh.truncate()
-            fh.flush()
-            os.fsync(fh.fileno())
+        # 硬链接只能原地写（os.replace 会让两个名字分家）。原地写失去原子性，
+        # 所以：**先备份原字节**，写盘中途失败（磁盘满/kill/fsync 报错）就尽力
+        # 整份恢复回去，避免留下「前半新 + 后半旧」的混合文件 —— 而 cmd_edit /
+        # cmd_write / main 的错误文案过去都谎称「文件没被改动」。
+        backup = path.read_bytes()
+        try:
+            with open(path, "r+b") as fh:
+                fh.write(data)
+                fh.truncate()
+                fh.flush()
+                os.fsync(fh.fileno())
+        except BaseException:
+            try:
+                with open(path, "r+b") as fh:
+                    fh.write(backup)
+                    fh.truncate()
+                    fh.flush()
+                    try:
+                        os.fsync(fh.fileno())
+                    except OSError:
+                        pass
+            except OSError as rec_exc:
+                # 恢复也失败：必须说出来，不能静默（用户得知道文件可能已损坏）。
+                print(f"# ⚠ 硬链接写盘失败，且自动恢复原内容也失败（{rec_exc}）。"
+                      f"请立即检查 {path} 的内容。")
+            raise
         return
     # 临时文件名必须唯一：写 20MB 内容时被 kill，会留下一个等于整个新内容的
     # `.x.fstate-tmp`（实测 20,402,886 字节），而固定名字意味着下一次运行既不会
@@ -535,7 +775,9 @@ def _atomic_write(path: Path, data: bytes) -> None:
     dir_ = path.parent
     try:
         now = time.time()
-        for old_tmp in dir_.glob(f".{path.name}.fstate-tmp*"):
+        # glob.escape：文件名含 [ ] * ? 时，直接拼进 glob 模式会让清理静默失效
+        # （实测 '.a[1].txt.fstate-tmp*' 匹配不到 '.a[1].txt.fstate-tmp-...')。
+        for old_tmp in dir_.glob(glob.escape(f".{path.name}.fstate-tmp") + "*"):
             try:
                 if now - old_tmp.stat().st_mtime > 3600:
                     old_tmp.unlink()
@@ -579,6 +821,20 @@ def write_back(path: Path, tf: TextFile, text: str) -> None:
 _LAST_SHADOW_ERROR = ""
 
 
+def _shadow_text(lines: list[str]) -> str:
+    """把行列表拼成影子副本文本，且能无损 round-trip 回来。
+
+    `"\\n".join(lines)` 遇到「最后一行是空行」会丢一个换行：["a","b",""] ->
+    "a\\nb\\n"，split_lines 回读只剩 ["a","b"] 两行，于是每次外部改动都判
+    「快照不完整」、永久降级回全文。末尾补一个 \\n 即可对齐。
+    """
+    return "\n".join(lines) + ("\n" if lines and lines[-1] == "" else "")
+
+
+def _shadow_sha1(lines: list[str]) -> str:
+    return hashlib.sha1(_shadow_text(lines).encode("utf-8")).hexdigest()
+
+
 def save_shadow(path: Path, lines: list[str]) -> bool:
     """影子副本：只用于「外部改动后算 diff」，**刻意**统一成 UTF-8 + LF 存。
 
@@ -588,11 +844,15 @@ def save_shadow(path: Path, lines: list[str]) -> bool:
     diff 仍只报那一行。反过来按原编码存要多记一份 BOM/编码状态，收益为零、状态多一份。
 
     真正需要保真的是**被编辑的文件本身**，那走 `write_back()`，与这里无关。
+
+    写入走 _atomic_cache_write：非原子 write_text 写到一半被打断会留下半截快照，
+    而「半截恰好行数相同」还会绕过行数校验变成下面的假 diff 来源。
+    返回 bool；调用方成功后须用 _shadow_sha1(lines) 把内容指纹写进 meta。
     """
     global _LAST_SHADOW_ERROR
     try:
-        CACHE_HOME.mkdir(parents=True, exist_ok=True)
-        _shadow_path(path).write_text("\n".join(lines), encoding="utf-8")
+        blob = _shadow_text(lines).encode("utf-8")
+        _atomic_cache_write(_shadow_path(path), blob)
         _LAST_SHADOW_ERROR = ""
         return True
     except Exception as exc:
@@ -607,17 +867,25 @@ def _load_shadow(path: Path, meta: dict) -> tuple[list[str] | None, str]:
 
     影子副本是纯文本**覆盖写**。写到一半被打断、被清理工具截掉尾巴、被同步盘
     截断，都会留下一个「前半段还在」的文件。它看起来完全正常 —— 于是拿它跟
-    完整的新版本做 diff，后半段会被统统标成「新增」：真实只改了第 15 行，
-    工具却报「6..20 全是新增」，还据此让调用方去 `--mode range --start 6 --end 20`。
-    行数对不上就直接判废，退回「没有旧版本快照」这条路（给全文并说明原因）。
+    完整的新版本做 diff，后半段会被统统标成「新增」。行数对不上只是一个信号，
+    **内容被改但行数不变**（同步盘回退 / 别的工具覆盖 / 并发半截写）同样会编造
+    出根本不存在的差异。所以写入时记下内容指纹，读取时必须比对：
+    指纹对不上、或老缓存根本没有指纹（无法确认），一律降级为「没有旧版本快照」。
     """
     shadow = _shadow_path(path)
     if not shadow.is_file() or meta.get("shadow") is not True:
         return None, (meta.get("shadow_error") or "缓存里没有旧版本快照")
     try:
-        old_lines = split_lines(shadow.read_text(encoding="utf-8"))
+        content = shadow.read_text(encoding="utf-8")
     except Exception as exc:
         return None, f"旧版本快照读不出来（{type(exc).__name__}）"
+    # 内容指纹：老缓存（本轮之前写的）没有这个字段 → 无法确认 → 宁可降级重读，
+    # 绝不拿一份没校验过的快照去编 diff。这是向后兼容方案：新代码认得老 JSON，
+    # 老代码忽略新字段，不迁移、不改既有字段。
+    expected = meta.get("shadow_sha1")
+    if not expected or hashlib.sha1(content.encode("utf-8")).hexdigest() != expected:
+        return None, "旧版本快照内容校验不通过（可能被改动或来自旧版缓存），无法据此给差异"
+    old_lines = split_lines(content)
     want = meta.get("lines")
     if isinstance(want, int) and want >= 0 and len(old_lines) != want:
         return None, (f"旧版本快照不完整（记着 {want} 行，实际只有 {len(old_lines)} 行，"
@@ -656,16 +924,21 @@ def _unique_spill(spill_dir: Path, kind: str) -> Path:
     以前是 `{年-月-日-时:分:秒}-{kind}.txt`：同一秒内两次溢出（连读两个大文件、
     读一个再 diff 一个）会撞名，后写的把先写的覆盖掉，而两次提示里都理直气壮地
     让调用方「去那个路径看全文」—— 第一个文件的全文就这么没了，且没有任何痕迹。
-    加 pid + 自增序号，撞了就再往后找，宁可名字丑一点。
+    加 pid + 自增序号 + O_EXCL 原子占位，撞了就再往后找，宁可名字丑一点。
+    O_EXCL 是关键：`exists()` 之后再 write_text 之间仍有 TOCTOU —— 两个进程
+    可能同时判定同一个名字「不存在」，后写的把先写的全文无痕覆盖。
     """
     stamp = time.strftime("%Y%m%d-%H%M%S")
     n = 0
     while True:
-        name = f"{stamp}-{kind}" + (f"-{n}" if n else "") + ".txt"
+        name = f"{stamp}-{kind}-{os.getpid()}" + (f"-{n}" if n else "") + ".txt"
         sp = spill_dir / name
-        if not sp.exists():
+        try:
+            fd = os.open(str(sp), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            os.close(fd)
             return sp
-        n += 1
+        except FileExistsError:
+            n += 1
 
 
 def _emit(text: str, max_chars: int, kind: str) -> str | None:
@@ -680,9 +953,24 @@ def _emit(text: str, max_chars: int, kind: str) -> str | None:
         print(text)
         return None
     spill_dir = CACHE_HOME / "spill"
-    spill_dir.mkdir(parents=True, exist_ok=True)
-    sp = _unique_spill(spill_dir, kind)
-    sp.write_text(text, encoding="utf-8")
+    # 落溢出文件的每一步都可能失败（缓存目录被占成普通文件、磁盘满、没权限）。
+    # 以前全程无 try：正文一个字没打印、spill 也没落盘，内容彻底丢失，而 main
+    # 的 OSError 兜底还把人引向「文件被别的程序占用」这条完全无关的建议。
+    # 现在明确抛 _SpillError，main 单独给「输出没落盘」的文案。
+    try:
+        spill_dir.mkdir(parents=True, exist_ok=True)
+        sp = _unique_spill(spill_dir, kind)
+        sp.write_text(text, encoding="utf-8")
+    except OSError as exc:
+        # 把 O_EXCL 占位留下的空文件收掉，别在 spill 目录留垃圾。
+        try:
+            if "sp" in locals() and sp.exists() and sp.stat().st_size == 0:
+                sp.unlink()
+        except OSError:
+            pass
+        raise _SpillError(
+            f"输出溢出文件写不进去（{exc.strerror or exc}）: {spill_dir}"
+        ) from exc
     # --max-chars 3 这种极小值时，int(3*0.3)==0，`text[-0:]` 是**整个字符串**，
     # 于是「截断预览」反而把全文都打了出来，还打印「已截断 -1 字符」。
     # 两份都至少给 1 个字符，且保证 head+tail 不超过预算。
@@ -763,11 +1051,13 @@ def cmd_read(args: argparse.Namespace) -> int:
             print("  链接本身还在，只是目标没了；把目标文件恢复、或删掉这个链接再试。")
         return 2
     meta = _load_meta(path)
-    disk = sha1_of(path)
-    tf, why = load(path)
+    # 一次读字节，既算 sha1 又解出正文：sha1_of → load → stat 三次独立读之间
+    # 文件若被外部改动，缓存记的 sha1 与真正交付的正文就不是同一份（TOCTOU）。
+    raw, tf, why = _read_once(path)
     if tf is None:
         print(f"ERROR: 无法按文本读取（{why}）: {path}")
         return 2
+    disk = hashlib.sha1(raw).hexdigest()
     text, enc = tf.text, tf.label
     lines = split_lines(text)
     total = len(lines)
@@ -776,6 +1066,10 @@ def cmd_read(args: argparse.Namespace) -> int:
     first_time = not meta
 
     mode = args.mode
+    # 「降级为全文」时必须真的给全文：下面 full 分支按 args.mode=="full" 决定
+    # 不受 DEFAULT_MAX_LINES 限制，而降级时 args.mode 仍是 auto —— 以前 501 行
+    # 文件只给前 400 行还标「不算读过」，等于承诺给全文却食言。
+    force_full = False
     sess = _session_id()
     # 「正文已经完整交付过」= 有过一次未截断的全文读，且那次的版本号就是当前版本。
     # 这是 save/免读的**唯一**凭证。以前判的是「read_ranges 非空」，于是只读过
@@ -921,6 +1215,7 @@ def cmd_read(args: argparse.Namespace) -> int:
         print(f"# 没有可用的旧版本快照（{why_no_diff}），给不了差异，下面是全文"
               f"（超过 {SHADOW_LIMIT // 1024 // 1024} MB 的文件本就不存影子副本）。")
         mode = "full"
+        force_full = True
 
     if mode == "range":
         # args.start 已由 argparse 的 `type=_positive_line` 保证 ≥1，这里只管补默认值
@@ -962,7 +1257,7 @@ def cmd_read(args: argparse.Namespace) -> int:
     # auto 落下来的 full 才走默认上限（默认值是为了别把上下文一次吃光）。
     if args.max_lines is not None:
         limit = args.max_lines
-    elif args.mode == "full":
+    elif args.mode == "full" or force_full:
         limit = total
     else:
         limit = min(total, DEFAULT_MAX_LINES)
@@ -993,6 +1288,13 @@ def _bump(path: Path, meta: dict, disk: str, lines: list[str], enc: str,
     # mode="full" 且 rng 覆盖 1..total（调用方在下面按 len(show)==total 传入）。
     delivered_full = mode == "full" and rng is not None and total is not None and list(rng) == [1, total]
     sess = _session_id()
+    # P0-1：`session` 与 `full_version` 必须由**同一次完整交付**共同签发。
+    # 过去每次读都无条件刷新 session，但非全文读既不清 full_version 也不动凭证：
+    # 会话 A 全文读（fv=1, session=A）→ 新会话 B 只做一次 range/diff/截断读 →
+    # session 被刷成 B，fv 仍是 1 → B 再 read 命中「本会话已完整交付过」，
+    # 把从未进过上下文的 495 行永久跳过。凭证和签发会话必须同生共死：
+    # 非全文读一律不动这两项（保留上一次完整交付的签发者）。
+    signing_session = sess if delivered_full else meta.get("session")
 
     ranges = meta.get("read_ranges") or []
     if rng:
@@ -1030,7 +1332,7 @@ def _bump(path: Path, meta: dict, disk: str, lines: list[str], enc: str,
         "read_count": meta.get("read_count", 0) + 1,
         "last_read_at": now,
         "read_ranges": ranges[-20:],
-        "session": sess,
+        "session": signing_session,
     })
     # 免读凭证：只有「整篇正文真的进了这次上下文」才发，且绑定版本号。
     # 以前判的是「read_ranges 非空」—— 那个字段记的是「读到过哪些行」，局部读也有值，
@@ -1046,9 +1348,13 @@ def _bump(path: Path, meta: dict, disk: str, lines: list[str], enc: str,
         if not meta.get("shadow") or mode in ("full", "changed", "truncated"):
             if save_shadow(path, lines):
                 meta["shadow"] = True
+                # 内容指纹：_load_shadow 据此判断快照有没有被篡改/串台。
+                # 老缓存没有这个字段 → 读取侧降级为「无法确认」，不伪造 diff。
+                meta["shadow_sha1"] = _shadow_sha1(lines)
                 meta.pop("shadow_error", None)
             else:  # 真失败了要知道，别静默降级
                 meta["shadow"] = False
+                meta["shadow_sha1"] = None
                 meta["shadow_error"] = _LAST_SHADOW_ERROR
     if diff:
         meta["last_diff"] = diff[:200_000]
@@ -1058,6 +1364,15 @@ def _bump(path: Path, meta: dict, disk: str, lines: list[str], enc: str,
 # ---------------------------------------------------------------- edit
 
 def cmd_edit(args: argparse.Namespace) -> int:
+    # per-file 锁包住「读全文 → 替换 → 整篇写回 → 更新缓存」整个临界区。
+    # 没有它，两个并发 edit 各自读到旧内容、各自整篇写回，后写者把先写者的
+    # 改动物理覆盖掉（lost update），而且第一次 edit 无缓存时连警告都没有。
+    # 锁按文件粒度，不同文件互不阻塞；进程退出 OS 自动释放，不会死锁。
+    with _cache_lock(resolve_input(args.path)):
+        return _cmd_edit_unlocked(args)
+
+
+def _cmd_edit_unlocked(args: argparse.Namespace) -> int:
     path = resolve_input(args.path)
     if path.is_dir():
         print(f"ERROR: 这是目录不是文件: {path}")
@@ -1066,7 +1381,7 @@ def cmd_edit(args: argparse.Namespace) -> int:
         hint = _broken_link_hint(path)
         print(f"ERROR: {hint or '文件不存在'}: {path}")
         return 2
-    tf, why = load(path)
+    raw, tf, why = _read_once(path)
     if tf is None:
         print(f"ERROR: 无法按文本编辑（{why}）: {path}")
         return 2
@@ -1147,7 +1462,8 @@ def cmd_edit(args: argparse.Namespace) -> int:
     # 编辑前先记下「我读到的是什么版本」和「磁盘现在是什么」。
     # 两者不同 → 在我上次读完之后，有别人动过这个文件。
     meta = _load_meta(path)
-    pre_sha = sha1_of(path)
+    # 与交付正文同源的字节算 sha1（不再二次读盘），消除 TOCTOU。
+    pre_sha = hashlib.sha1(raw).hexdigest()
     cache_sha = meta.get("sha1")
     external_changed = bool(cache_sha) and cache_sha != pre_sha
     # 外部改过时，diff 的「旧版本」应该是我上次读到的那个版本（影子副本），
@@ -1177,7 +1493,19 @@ def cmd_edit(args: argparse.Namespace) -> int:
                    args.label or path.name)
     rng = changed_lines_range(old_lines, new_lines) or hunks_new_range(diff)
 
-    disk = sha1_of(path)
+    # 写后字节自检：edit 过去没有（write 有）。并行写入/外部改动让磁盘内容
+    # 不等于我刚写下去的内容时必须说出来，不能假装「已改」并据此更新缓存。
+    try:
+        on_disk = path.read_bytes()
+    except OSError as exc:
+        print(f"ERROR: 改完读不回来（{exc.strerror or exc}）: {path}")
+        return 2
+    payload = tf.encode(new_text)
+    if on_disk != payload:
+        print(f"# ⚠ 写回自检未通过：磁盘字节与写下去的不一致（{len(on_disk)} vs {len(payload)} 字节）")
+        print(f"#   {path} 可能被别的程序同时改动。请用 read --mode full 重新确认内容。")
+        return 2
+    disk = hashlib.sha1(on_disk).hexdigest()
     meta.update({
         "path": str(path.resolve()), "sha1": disk, "lines": len(new_lines),
         "encoding": enc, "size": path.stat().st_size, "mtime": path.stat().st_mtime,
@@ -1193,8 +1521,15 @@ def cmd_edit(args: argparse.Namespace) -> int:
     })
     if path.stat().st_size <= SHADOW_LIMIT:
         meta["shadow"] = save_shadow(path, new_lines)
-        if not meta["shadow"]:
+        if meta["shadow"]:
+            meta["shadow_sha1"] = _shadow_sha1(new_lines)
+            meta.pop("shadow_error", None)
+        else:
+            meta["shadow_sha1"] = None
             meta["shadow_error"] = _LAST_SHADOW_ERROR
+            # 不能静默：调用方看到「# 已改」会以为一切正常，其实下次给不了差异。
+            print(f"# ⚠ 旧版本快照保存失败（{_LAST_SHADOW_ERROR}）："
+                  f"本次修改已落盘，但下次外部改动将无法给出差异。")
     _save_meta(path, meta)
 
     print(f"# 已改 {path}  → v{meta['version']}  {len(new_lines)} 行"
@@ -1226,6 +1561,12 @@ def cmd_edit(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------- write
 
 def cmd_write(args: argparse.Namespace) -> int:
+    # 与 cmd_edit 同理：整体覆盖是「读规格 → 写 → 自检 → 更新缓存」的临界区。
+    with _cache_lock(resolve_input(args.path)):
+        return _cmd_write_unlocked(args)
+
+
+def _cmd_write_unlocked(args: argparse.Namespace) -> int:
     """新建/整体覆盖：老内容存在就给 diff，不存在就只报行数与前几行。
 
     写回规格（编码 / BOM / 换行）优先级：`--encoding` > 原文件 > UTF-8 + LF。
@@ -1363,6 +1704,13 @@ def cmd_write(args: argparse.Namespace) -> int:
         print(f"ERROR: 内容无法用 {codec} 编码：{exc}")
         print("  文件没被改动。换编码请加 --encoding utf-8")
         return 2
+    # >8MB：过去 payload 照写不误、os.replace 已把原文件永久替换，之后写后自检
+    # load() 才因 toolarge 失败回 rc=2 —— 工具说「失败」，文件其实已被 9MB 覆盖。
+    # 上限必须在写盘之前就拒，原文件一个字节都不动。
+    if len(payload) > 8 * 1024 * 1024:
+        print(f"ERROR: 新内容 {len(payload)} 字节超过本工具上限 8MB，拒绝写入: {path}")
+        print("  文件没被改动。请用别的工具处理这个大文件。")
+        return 2
     # 内容与磁盘上逐字节相同时，就是「没改」。以前照写不误：版本号 +1、
     # 缓存凭证作废、还打一行「已改 → v2」—— 一次什么都没改的调用却让下一个
     # read 多给一遍全文，而调用方以为自己在做幂等操作。
@@ -1375,6 +1723,15 @@ def cmd_write(args: argparse.Namespace) -> int:
                 return 0
         except OSError:
             pass
+    # 写盘前留一份原字节：下面自检失败时尽力整份回滚。否则 os.replace 已经把
+    # 原文件换掉，工具却只打印一句「可能被别的程序同时改动」+ rc=2，调用方
+    # 还以为文件没动 —— 一次「报失败」的调用静默毁掉了原文件。
+    backup: bytes | None = None
+    if existed:
+        try:
+            backup = path.read_bytes()
+        except OSError:
+            backup = None
     try:
         _atomic_write(path, payload)
     except OSError as exc:
@@ -1391,20 +1748,29 @@ def cmd_write(args: argparse.Namespace) -> int:
     # 发生时，它每次都全绿、rc=0，还照样打印「已改」。**这是比单个 bug 更严重的东西：
     # 它给人的是一条虚假的安全感。**
     # 现在直接比字节：磁盘上的必须就是我写下去的那串字节，一个字都不能差。
+    def _rollback(reason: str) -> int:
+        if backup is None:
+            print(f"# ⚠ {reason}；原内容没有留底，无法自动恢复。请立即检查 {path} 的内容。")
+            return 2
+        try:
+            _atomic_write(path, backup)
+            print(f"# ⚠ {reason}；已自动把原内容恢复回去。")
+        except OSError as rec_exc:
+            print(f"# ⚠ {reason}；且自动恢复原内容失败（{rec_exc}）。请立即检查 {path} 的内容。")
+        return 2
+
     try:
         on_disk = path.read_bytes()
     except OSError as exc:
-        print(f"ERROR: 写完读不回来（{exc.strerror or exc}）: {path}")
-        return 2
+        return _rollback(f"写完读不回来（{exc.strerror or exc}）")
     if on_disk != payload:
-        print(f"# ⚠ 写回自检未通过：磁盘上的字节和写下去的不一致（{len(on_disk)} vs {len(payload)} 字节）")
-        print(f"#   文件可能被别的程序同时改动。请重新确认 {path} 的内容。")
-        return 2
+        return _rollback(
+            f"写回自检未通过：磁盘字节和写下去的不一致（{len(on_disk)} vs {len(payload)} 字节），"
+            f"文件可能被别的程序同时改动"
+        )
     check, why2 = load(path)
     if check is None:
-        print(f"# ⚠ 写回自检：这份文件写入后自己读不回来（{why2}）。")
-        print(f"#   规格 [{enc}] 与内容不兼容，换编码请用 --encoding utf-8。")
-        return 2
+        return _rollback(f"写回自检：这份文件写入后自己读不回来（{why2}），规格 [{enc}] 与内容不兼容")
     if mixed and body != (original.text if original else ""):
         print(f"# 注意：原文件是混合换行，新内容按你给的换行原样写入（没有替你统一）。")
 
@@ -1429,8 +1795,14 @@ def cmd_write(args: argparse.Namespace) -> int:
     })
     if path.stat().st_size <= SHADOW_LIMIT:
         meta["shadow"] = save_shadow(path, new_lines)
-        if not meta["shadow"]:
+        if meta["shadow"]:
+            meta["shadow_sha1"] = _shadow_sha1(new_lines)
+            meta.pop("shadow_error", None)
+        else:
+            meta["shadow_sha1"] = None
             meta["shadow_error"] = _LAST_SHADOW_ERROR
+            print(f"# ⚠ 旧版本快照保存失败（{_LAST_SHADOW_ERROR}）："
+                  f"本次写入已落盘，但下次外部改动将无法给出差异。")
     _save_meta(path, meta)
 
     head = "已改" if existed else "已新建"
@@ -1510,6 +1882,9 @@ def cmd_digest(args: argparse.Namespace) -> int:
         print(f"# 结构摘要  {len(uniq)} 个文件")
     if scan_info.get("capped"):
         print(f"# ⚠ 只扫描了前 {args.max_scan} 个文件（--max-scan），目录里还有没看的")
+    pruned = _pruned_note(scan_info)
+    if pruned:
+        print(f"# {pruned}")
     if skipped:
         names = "、".join(x.name for x in skipped[:6])
         more = f" 等 {len(skipped)} 个" if len(skipped) > 6 else ""
@@ -1530,7 +1905,11 @@ def cmd_digest(args: argparse.Namespace) -> int:
         lines = split_lines(text)
         cached = ""
         if meta:
-            same = meta.get("sha1") == sha1_of(p)
+            # 扫描过程中文件被删/权限变化不该让整份摘要半途崩掉（已经吐了一半报告）。
+            try:
+                same = meta.get("sha1") == sha1_of(p)
+            except OSError:
+                same = False
             cached = f"  已读 {meta.get('read_count', 0)} 次" + ("" if same else "  ⚠磁盘已变")
         print(f"\n## {rel}  {len(lines)} 行  [{enc}]{cached}")
         if len(lines) < 300 and max((len(l) for l in lines), default=0) > 5000:
@@ -1625,19 +2004,37 @@ def cmd_diff(args: argparse.Namespace) -> int:
     meta = _load_meta(p)
     d = meta.get("last_diff")
     if not d:
-        print("没有记录到 diff（还没用本脚本编辑过该文件）")
+        if _LAST_META_BAD:
+            # 别把「缓存条目损坏」误报成「还没编辑过」—— 那会掩盖真正的线索。
+            print(f"没有记录到 diff（缓存条目损坏并已丢弃：{_LAST_META_BAD}；"
+                  f"请重新 read --mode full 建立缓存）")
+        else:
+            print("没有记录到 diff（还没用本脚本编辑过该文件）")
         return 0
-    _emit(d, args.max_chars, "diff")
+    sp = _emit(d, args.max_chars, "diff")
+    if sp:
+        print(f"\n[注意：diff 没完整进入上下文，全文只在 {sp}。]")
     return 0
 
 
 def cmd_reset(args: argparse.Namespace) -> int:
     path = resolve_input(args.path)
     removed = 0
-    for p in (_meta_path(path), _shadow_path(path)):
-        if p.is_file():
-            p.unlink()
-            removed += 1
+    errors: list[str] = []
+    # .lock 也一起清：它是缓存目录里的伴随文件，留着没有害处但会让用户困惑。
+    for p in (_meta_path(path), _shadow_path(path), _lock_path(path)):
+        try:
+            if p.is_file():
+                p.unlink()
+                removed += 1
+        except OSError as exc:
+            # 删不掉要说清楚，不能裸栈（main 的「文件本身没有被改过」对 reset 更是
+            # 张冠李戴：reset 根本不碰目标文件）。
+            errors.append(f"{p.name}: {exc.strerror or exc}")
+    if errors:
+        print(f"ERROR: 清缓存时有文件删不掉: {'; '.join(errors)}")
+        print("  这是缓存文件，不影响目标文件本身。检查缓存目录权限再试。")
+        return 2
     if removed:
         print(f"已清缓存: {path}")
     else:
@@ -1649,6 +2046,7 @@ def cmd_reset(args: argparse.Namespace) -> int:
 def cmd_hot(args: argparse.Namespace) -> int:
     rows = []
     orphan_shadows = 0
+    bad_meta = 0
     if CACHE_HOME.is_dir():
         known = {f.stem for f in CACHE_HOME.glob("*.json")}
         # 影子副本没有对应的 .json 时永远不会有命令去碰它 ——
@@ -1659,12 +2057,21 @@ def cmd_hot(args: argparse.Namespace) -> int:
             try:
                 m = json.loads(f.read_text(encoding="utf-8"))
             except Exception:
+                # 静默 continue 会让「缓存里还没有记录」变成假象，坏条目也永远
+                # 不算孤儿（因为 known 把它当主人）。数出来、并从 known 里剔掉。
+                bad_meta += 1
+                known.discard(f.stem)
                 continue
             # 结构不对的条目在这里也要筛掉：以前 `[]` 或错类型会一路带到
             # rows.append 里变成 `'list' object has no attribute 'get'` 裸栈。
             if not _meta_sane(m)[0]:
+                bad_meta += 1
+                known.discard(f.stem)
                 continue
             rows.append((m.get("read_count", 0), m.get("path", "?"), m.get("lines", 0)))
+        # known 被上面剔过之后再数一次，坏条目的 .shadow 才算孤儿。
+        orphan_shadows = sum(1 for f in CACHE_HOME.glob("*.shadow") if f.stem not in known)
+    warn = f"# ⚠ 有 {bad_meta} 个缓存条目损坏（已跳过，不计入排行）" if bad_meta else ""
     rows.sort(reverse=True)
 
     def _spill_line() -> str:
@@ -1689,13 +2096,19 @@ def cmd_hot(args: argparse.Namespace) -> int:
                 f"   只有补看被截掉的内容时才用得上；reset 不会清这里，要收回空间就手动删。")
 
     if not rows:
-        print("缓存里还没有记录（还没用 fstate read 过任何文件）")
+        if warn:
+            print(warn)
+            print("缓存里没有可用记录（还没用 fstate read 过任何文件，或记录都损坏了）")
+        else:
+            print("缓存里还没有记录（还没用 fstate read 过任何文件）")
         if orphan_shadows:
             print(f"# ⚠ 但有 {orphan_shadows} 个孤儿影子副本（没有对应 .json），占着磁盘")
         tail = _spill_line()
         if tail:
             print(tail)
         return 0
+    if warn:
+        print(warn)
     print("读次数  行数   文件")
     for c, p, n in rows[: args.n]:
         flag = "  ← 反复读，考虑改用 range/diff" if c >= 5 else ""
@@ -1718,18 +2131,32 @@ def cmd_hot(args: argparse.Namespace) -> int:
 
 def iter_files(root: Path, max_files_scan: int, info: dict | None = None):
     """遍历可读源码文件。info 非 None 时，若因 max_files_scan 提前收手会置 capped=True——
-    调用方必须把这件事说出来，否则「扫描 30 个」会被读成「目录里只有 30 个」。"""
+    调用方必须把这件事说出来，否则「扫描 30 个」会被读成「目录里只有 30 个」。
+
+    同时把「剪枝」计数写进 info：被跳过的忽略目录 / 非源码后缀 / 隐藏文件 / 超大文件
+    以前全是静默 continue，用户会以为「目录里就这些文件」。调用方 _pruned_note()
+    据此输出一行可观测提示——跳过也得让用户看得见。
+    """
     seen = 0
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")]
+        kept = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")]
+        if info is not None:
+            info["pruned_dirs"] = info.get("pruned_dirs", 0) + (len(dirnames) - len(kept))
+        dirnames[:] = kept
         for fn in filenames:
             if Path(fn).suffix.lower() in SKIP_EXT or fn.startswith(".") or SKIP_NAME_RE.match(fn):
+                if info is not None:
+                    info["pruned_files"] = info.get("pruned_files", 0) + 1
                 continue
             p = Path(dirpath) / fn
             try:
                 if p.stat().st_size > SKIP_SCAN_LIMIT:
+                    if info is not None:
+                        info["pruned_large"] = info.get("pruned_large", 0) + 1
                     continue
             except OSError:
+                if info is not None:
+                    info["pruned_unreadable"] = info.get("pruned_unreadable", 0) + 1
                 continue
             seen += 1
             if seen > max_files_scan:
@@ -1737,6 +2164,31 @@ def iter_files(root: Path, max_files_scan: int, info: dict | None = None):
                     info["capped"] = True
                 return
             yield p
+
+
+def _pruned_note(info: dict) -> str:
+    """把 iter_files 记下的剪枝计数合成一句说明（不含缩进前缀）。
+
+    没发生剪枝时返回空串——不加这行噪音，保持 CLI 输出与旧版逐字一致。
+    """
+    d = info.get("pruned_dirs", 0)
+    f = info.get("pruned_files", 0)
+    lg = info.get("pruned_large", 0)
+    ur = info.get("pruned_unreadable", 0)
+    total = d + f + lg + ur
+    if not total:
+        return ""
+    bits = []
+    if d:
+        bits.append(f"{d} 个忽略目录（node_modules/dist/.git 等）")
+    if f:
+        bits.append(f"{f} 个非源码/隐藏/锁定文件")
+    if lg:
+        bits.append(f"{lg} 个超大文件（>{SKIP_SCAN_LIMIT // 1024 // 1024}MB）")
+    if ur:
+        bits.append(f"{ur} 个读不到大小的文件")
+    return (f"扫描剪枝：跳过 {'、'.join(bits)}，共 {total} 项没参与匹配"
+            f"（不是目录里没有，是这次没看；指定更精确的 --root 再看）")
 
 
 def cmd_explore(args: argparse.Namespace) -> int:
@@ -1779,10 +2231,12 @@ def cmd_explore(args: argparse.Namespace) -> int:
                 score += 4
         text, why_read = read_text(p)
         if text is None:
-            # 单个文件读不了（被独占、没权限、二进制）不该让整次摸底失败。
+            # 单个文件读不了（被独占、没权限、二进制、超大）不该让整次摸底失败。
             # explore 恰恰是拿去「在陌生仓库里翻东西」的，一个被锁住的 .db/.log
             # 以前会让整个命令吐 Traceback，连已经命中的文件都看不到。
-            if why_read and why_read not in ("binary", "toolarge"):
+            # binary/toolarge 以前被静默吞掉：用户以为「目录里就这些文本文件」，
+            # 其实有一批被跳过了。跳过也要让用户看得见。
+            if why_read:
                 unreadable.append((rel, why_read))
             if score:
                 hits.append({"rel": rel, "abs": str(p), "score": score, "lines": [], "sigs": [], "snip": ""})
@@ -1855,6 +2309,9 @@ def cmd_explore(args: argparse.Namespace) -> int:
           + (f"（其余 {len(hits)-len(top)} 个看 --max-files）" if len(hits) > len(top) else ""))
     if scan_info.get("capped"):
         print(f"  ⚠ 扫描在 {args.max_scan} 个文件处截断（--max-scan），更深的没看。没找到就调大它。")
+    pruned = _pruned_note(scan_info)
+    if pruned:
+        print(f"  ⚠ {pruned}")
     if skipped_bundle:
         # 以前这个计数器只加不读：打包产物被静默跳过，没人知道。
         # 而「答案没找到」和「答案在那个 bundle 里但我没看」是完全不同的两件事。
@@ -1940,7 +2397,7 @@ def main() -> int:
     e.add_argument("--max-sigs", type=_positive_int, default=6, help="每文件列几条签名（默认 6）")
     e.add_argument("--snippet-lines", type=_positive_int, default=4, help="每处命中带几行上下文（默认 4）")
     e.add_argument("--max-scan", type=_positive_int, default=6000, help="最多扫描多少个文件（默认 6000，超了会明说截断）")
-    e.add_argument("--min-score", type=float, default=3.0, help="低于这个分数的命中不列（默认 3.0）")
+    e.add_argument("--min-score", type=_finite_float, default=3.0, help="低于这个分数的命中不列（默认 3.0；nan/inf 会被拒）")
     e.add_argument("--max-chars", type=_positive_int, default=24000, help="输出字符上限，超了落盘并只给预览（默认 24000）")
     e.set_defaults(fn=cmd_explore)
 
@@ -2029,6 +2486,18 @@ def main() -> int:
     # 而下游那些写得很好的「文件没被改动」分支一次都轮不到执行。
     try:
         return args.fn(args)
+    except _StdinDecodeError as exc:
+        # 必须排在 OSError 之前（它是 OSError 子类）。这不是「文件被占用」，
+        # 是 stdin 内容本身不合法；文件一个字节都没写。
+        print(f"ERROR: {exc}")
+        print("  文件没被改动。")
+        return 2
+    except _SpillError as exc:
+        # 必须排在 OSError 之前（_SpillError 是它的子类）。输出阶段失败时正文
+        # 一字没进上下文、spill 也没落盘 —— 别把它引向「检查文件占用」。
+        print(f"ERROR: 输出溢出文件失败（{exc}）")
+        print("  这次输出没有完整进入上下文，也没有落盘；请用 read --mode full 重新取全文。")
+        return 2
     except OSError as exc:
         where = getattr(args, "path", "")
         name = exc.strerror or str(exc)
@@ -2039,10 +2508,18 @@ def main() -> int:
             return 2
         print(f"ERROR: 读写失败（{name}）: {where}")
         print("  文件可能正被别的程序占用（Word/Excel/编辑器/杀软），或没有权限。"
-              "关掉它再试；文件本身没有被改过。")
+              "关掉它再试；不要仅凭这次输出判断磁盘现状，请用 read 确认。")
+        return 2
+    except Exception as exc:
+        # 以前只兜 OSError：json 异常 / UnicodeError / ValueError / RecursionError
+        # 会裸栈 rc=1，Agent 拿到一屏 Python 堆栈而不是一句可行动的话。
+        print(f"ERROR: 未预期的错误（{type(exc).__name__}）: {exc}")
+        print("  不要凭这次输出判断磁盘现状，请用 read --mode full 确认。")
         return 2
     except KeyboardInterrupt:
-        print("\n已中断（没有写盘，或写盘是原子的：不会留下半截文件）。")
+        # 写盘是原子的没错，但中断也可能发生在硬链接原地写/写后自检之间。
+        # 别用一句「不会留下半截文件」替用户担保他没亲眼确认过的磁盘状态。
+        print("\n已中断。不要用这次输出判断磁盘现状，请用 read --mode full 确认。")
         return 130
 
 

@@ -1,5 +1,77 @@
 # Changelog
 
+## 1.1.0 — 2026-11-11
+
+这一版**只做现有功能的质量优化，不新增任何业务功能**。做法沿用 1.0.9 的教训：用两个独立上下文的评审员分头攻击（缓存正确性/并发 / 异常恢复/文件完整性），交叉验证后再自己逐行复核；先写 pytest 复现 bug，再按 P0→P1 修，最后实跑验收。定位、命令、`explore/read/edit/write/digest/state/diff/reset/hot` 全部保持，**CLI 参数与退出码不变**，JSON 缓存结构只**新增一个可选字段** `shadow_sha1`。
+
+贯穿全程的原则只有一句，1.0.9 已经立过、这版把它守到底：**任何无法确认的状态，都降级为重新读取，绝不伪造缓存命中；宁可少缓存一次，也不能错误地告诉 Agent 文件没变。**
+
+### 支持范围（1.1.0 定位）
+
+**本版起只针对 Windows 10 / 11 优化与维护**：Python 3.8+、零第三方运行时依赖、保持现有 DSH 插件兼容。**Linux / macOS / 跨平台适配均不在范围内，也不做跨平台验证**——这是范围界定，不是「未验证」。代码里保留的 `fcntl` / `msvcrt` 条件分支是标准库按平台选锁实现，不构成对非 Windows 平台的可用性承诺。发布前在 **Windows 10 Pro（NT 10.0.26300）** 上用 **Python 3.13.13 / pytest 9.2.0** 与 **Python 3.8.20 / pytest 8.3.4** 双版本实跑全量测试，并补了 10 个 Windows 专属文件安全用例（真实独占句柄 / 只读属性 / `os.replace` 替换失败 / 持锁崩溃不留死锁 / 多进程并发读写 / 缓存 JSON 损坏 / Shadow 丢失与损坏）。
+
+### P0 缓存正确性（最高优先）
+
+- **【头号 · 会直接骗过 Agent】跨会话伪造「内容未变」**：`_bump` 每次读都无条件把 `session` 刷成当前会话，但非全文读既不设也不清 `full_version`。于是会话 A 全文读（签发凭证）→ **全新会话 B** 做一次任意「版本不变的非全文读」（range / diff / 被截断）→ 会话 B 再 `read`，就回「内容未变，且本会话已完整交付过 v1 的正文」，把几百行从未进过上下文的正文永久跳过。1.0.9 加的 `same_session` 校验被这次刷新自己架空了。现在 `full_version` 与 `session` 由同一次「完整交付」共同签发（`signing_session = sess if delivered_full else meta.get("session")`）：非全文读两项都不动，跨会话 `same_session` 必为 False。常规「同会话连续 read」测试永远撞不到这个组合，所以两个独立评审员都把它列为最危险、最易漏的一个。
+- **影子副本同行数篡改会编造假 diff**：`_load_shadow` 只校 `len(old_lines) == meta.lines`，从不校内容。同步盘回退 / 别的工具覆盖 / 半截写恰好行数相同，都能让 `read --mode diff` 输出根本不存在的 `-旧行/+新行`，随后 `_bump` 还把影子重写成磁盘真值、把篡改痕迹自己抹掉。现在 meta 记 `shadow_sha1`（`"…\n".join` 的 sha1），读回对不上就返回「旧版本快照内容校验不通过…无法据此给差异」并降级给全文。**老缓存没有这个字段 → 同样按「无法确认」降级，不给 diff**（这就是本次的向后兼容方案：新代码认老 JSON、老代码忽略新字段）。
+- **影子副本末尾空行 round-trip 永久对不上**：`split_lines("a\nb\n\n")` 得 3 行，`"\n".join` 回去只有 2 行，于是带末尾空行的文件每次外部改动都被迫降级全文。现在 `_shadow_text` 在末行为空时补回一个 `\n`，行数自洽。
+- **「降级为全文」只给了前 400 行**：无可用影子时 `mode="full"`，但 `limit` 判的是 `args.mode == "full"`（此时仍是 `auto`），于是 501 行文件只给 400 行还标「不算读过」。现在降级置 `force_full=True`，真的给整篇。
+
+### P0 并发安全
+
+- **`edit` 无锁导致 lost update（会物理丢数据）**：`load` 读全文 → 整篇 `write_back`，中间既不锁也不校验磁盘是否仍等于读到的内容；两个进程同时 edit、或 A 读完 B 外部改动，后写者用旧 text 整篇覆盖，别人的改动无声消失，首次 edit（无缓存）连 ⚠ 都不打。现在加**轻量 per-file 文件锁** `_cache_lock`（进程内 `threading.RLock` + 跨进程 `fcntl.flock` / `msvcrt.locking`，锁文件 `CACHE_HOME/{key}.lock`，进程崩溃由 OS 自动释放、不留死锁），只包住 `edit`/`write` 的「读→写→更新缓存」临界区；`read` 不加锁，配合下面的同源读取，最坏只是「少缓存一次」。**没有引入 Redis / 数据库 / 后台服务**，全是标准库。
+- **元数据与影子副本非原子、无锁**：`_save_meta` / `save_shadow` 的 `write_text` 会被并发写覆盖成半截 JSON / 半截影子，半截影子行数恰好对得上还能变成上面「假 diff」的源头。现在统一走 `_atomic_cache_write`（唯一临时名含 pid+随机、fsync、`os.replace`、Windows `PermissionError` 重试 6 次），临时文件互不覆盖，崩溃最多留一个可清理的孤儿 tmp。
+- **sha1 与交付正文不同源（TOCTOU）**：`read` 原来 `sha1_of(path)` → `load(path)` → `stat` 是三次独立读，缓存记下的 sha1 可能属于另一版字节，下次谎报「磁盘已变」却给空 diff。现在 `_read_once` 一次 `read_bytes`，`disk = hashlib.sha1(raw)`，`read`/`edit`/`write` 的 sha1 与实际交付/写入的内容严格同源。
+- **spill 溢出文件跨进程同名覆盖**：`_unique_spill` 的秒级时间戳 `exists()`→`write_text` 之间有 TOCTOU，两进程同秒同类溢出返回同名路径，后写覆盖先写、全文无痕丢失。现在名字加 pid，并用 `os.open(O_CREAT|O_EXCL)` 原子占位。
+
+### P0 文件完整性
+
+- **二进制检测形同虚设**：`FALLBACK_ENCODINGS` 里 `latin-1` 把任意字节一一映射、永不抛异常，加上只查前 8192 字节有没有 NUL，于是「后段才出现 NUL」和「无 NUL 但满是控制字节」都被当文本读进缓存，随后被 `edit` 的换行归一改写字节。新增 `_looks_binary`：全文含 `b"\x00"`，或解码后不可打印 C0 控制字符（排除 `\t\n\r\f\x0b`）占比 > 0.005，判 binary 拒读。UTF-16/32 走 BOM 候选，不受影响。
+- **硬链接原地写半途失败会毁掉所有别名**：`open(path,"r+b")` 先 write 后 truncate，磁盘满/kill 时留「前半新 + 前半旧」混合文件，而硬链接共享 inode、所有名字一起坏；三处错误文案还都说「文件没被改动 / 不会留下半截文件」。现在写前 `backup = path.read_bytes()`，异常时用 backup best-effort 原地恢复再抛，恢复不了明确告警。
+- **`write` 写后自检失败时原文件已被替换却不回滚**：`os.replace` 成功后才自检，失败只打印 rc=2，调用方以为文件没动。现在写前留 backup，`on_disk != payload` / 写完读不回来一律调 `_rollback` 把原内容恢复回去并明说。
+- **>8 MB 的 `write` 覆盖完原文件才报失败**：`load` 拒读 >8 MB，但 `write` 无上限、`os.replace` 已落盘，自检 `load` 返回 None 才 rc=2。现在 `payload` 编码后、写盘前就拒绝，原文件一字节不动。
+- **大小写敏感文件系统上路径串台**：`_key` 无条件 `.lower()`，Linux 上 `Foo.py` 与 `foo.py` 共用一条缓存，内容相同时在后者身上伪造「内容未变」。改用 `os.path.normcase`（Windows 仍折叠、POSIX 保留大小写），`digest` 去重同源修正。
+
+### P1 异常恢复 / 不再静默吞异常
+
+- **损坏的 JSON 永不自愈**：`_load_meta` 解析失败只 `return {}`，坏文件一直留盘，每次 read/edit/state/hot/diff 反复重解析、反复当「从没读过」重发全文，`state` 还谎称「已损坏并丢弃」。现在解析失败也 `p.unlink()`，下次自动重建；结构不合法本就删，两条路径一致。
+- **缓存写失败只兜 OSError**：`json.dumps` 的 TypeError/ValueError/UnicodeEncodeError 会裸栈。现在收口 `(OSError, TypeError, ValueError)`，保留「缓存写不进去…不影响这次输出，只是这次读不会被记住」的诚实文案。
+- **`hot` 静默跳过损坏条目**：`except Exception: continue` 让坏 JSON 在排行里凭空消失，还把它算成「有主」、连孤儿影子都不报。现在计数、从 `known` 排除、打印「# ⚠ 有 N 个缓存条目损坏（已跳过，不计入排行）」，并把这些条目的影子重新计入孤儿。
+- **`reset` 删不掉缓存文件就裸奔**：`p.unlink()` 无保护，失败时 main 的 OSError 文案还说「文件本身没有被改过」（reset 根本不碰目标文件）。现在逐个 try/except、把 `.lock` 一并删、有删不掉的明确列出来 rc=2。
+- **spill 落盘失败文案张冠李戴**：`_emit` 的 mkdir/写文件全程无 try，失败冒泡到 main 的 OSError 分支，提示「文件可能正被别的程序占用…文件本身没有被改过」，而事实是**正文一字没输出、spill 也没落盘**。现在抛 `_SpillError`，main 单独分支说「输出溢出文件失败…这次输出没有完整进入上下文，也没有落盘；请用 `read --mode full` 重新取全文」，rc=2。
+- **`main` 只兜 OSError**：其余异常（Unicode/ValueError/…）裸栈 rc=1；OSError 分支「文件本身没有被改过」在半写/自检失败/外部并发改动三处是假承诺。现在补 `except Exception` 兜底（明确错误类型 + 「请用 `read --mode full` 确认磁盘现状」rc=2），OSError 与 `KeyboardInterrupt` 文案一律改成「不要用这次输出判断磁盘现状」。`_SpillError` 是 OSError 子类，单列在 `except OSError` 之前。
+- **其它静默降级**：`cmd_explore` 把 `binary`/`toolarge` 静默吞掉不进 `unreadable` → 现在照样计入；`cmd_digest` 的 `sha1_of(p)` 在扫描中文件被删时整份报告中断 → 单文件 try/except 跳过；`_atomic_write` tmp 清理用 `glob` 未转义文件名（`a[1].txt` 这类）→ 改 `glob.escape`；`_read_piece` 只试 utf-8-sig/gbk 与 `load` 不一致 → 补 BOM 候选 + latin-1；`cmd_diff` 忽略 `_emit` 返回的 spill 路径、缓存损坏时误报「还没编辑过」→ 都补上；`edit`/`write` 的 `save_shadow` 失败仍 rc=0 报「已改」不提 → 现在当次就打印「旧版本快照保存失败…下次外部改动将无法给出差异」。
+
+### 增量修复（「继续」轮，同一 1.1.0 内的质量补强）
+
+主任务交付后继续清理审计残留，仍是「先写测试复现 → 再修 → 全绿」，仍不加业务功能：
+
+- **`--min-score nan/inf` 让打分过滤失效**：裸 `type=float` 接受 nan/inf；`score < nan` 恒 False（门槛失效、命中全列灌水）、`score < inf` 恒 True（命中全被滤光却不说是参数害的）。新增 `_finite_float`（`math.isfinite`）作 argparse type，非有限值明确 rc=2。
+- **stdin 非法字节静默替换写进用户文件**：`_read_stdin_text` 末尾 `raw.decode("utf-8", errors="replace")` 把解不出的字节换成 U+FFFD，一次管道编码事故就这样变成永久内容损坏且 rc=0 无提示。现在抛 `_StdinDecodeError`（OSError 子类，main 单列分支排在 `except OSError` 之前），明确「拒绝用替换字符悄悄写进文件」rc=2，一个字节都不写。
+- **`iter_files` 静默剪枝不可观测**：被跳过的忽略目录 / 非源码后缀 / 隐藏 / 超大 / 读不到大小的文件全是静默 `continue`，用户会误以为「目录里就这些文件」。现在 `info` 记 `pruned_dirs/pruned_files/pruned_large/pruned_unreadable`，`_pruned_note()` 在 `explore`/`digest` 各输出一行「扫描剪枝：跳过 … 共 N 项没参与匹配」；**无剪枝时返回空串、不加噪音**（中性操作 CLI 输出逐字不变）。
+- **锁行为的白盒固化**：`tests/test_hardening_continue.py` 里有一组用「注入假 `fcntl` + 代理 `os.name`」验证 `_cache_lock` 上锁 / 解锁 / 异常时 `finally` 仍释放的白盒用例（属 83 个用例之一）。这是 1.1.0 开发期留下的锁状态机正确性测试，仅验证锁逻辑本身，**不构成对 Linux / macOS 的支持或验证**；本版定位为仅 Windows。
+
+### 兼容性
+
+- **运行时**：仍 Python 3.8+（`ast.parse(feature_version=(3,8))` 通过）、**零第三方运行时依赖**（新增全是标准库 `contextlib/glob/threading` 及平台条件导入 `fcntl`/`msvcrt`）。pytest 只在开发/测试期使用，不随运行时引入。
+- **CLI**：`--help` 子命令、全部参数、退出码、`state` 的纯 JSON 输出经 10 命令冒烟实跑无退化；只新增了几行提示/告警文案，没有删改既有措辞。
+- **缓存文件**：JSON 只**新增可选字段** `shadow_sha1`。老缓存没有该字段时按「无法确认」降级（重新给全文、不给 diff），绝不拿旧影子编造 diff；即用新版读老缓存安全，用旧版读新缓存会忽略该字段、同样安全。
+- **DSH 插件形态**：`package.json` / `cordis.patch.yml` / `lib/index.js` / `scripts/fstate` 一行未动，安装与调用方式不变。
+
+### 回归测试（本轮新增，可重跑）
+
+**这版和 1.0.9 之前最大的不同**：测试随仓库分发、能重复运行，不再是「一次性脚本、读者没法复核」。新增 `tests/conftest.py` + 6 个 pytest 文件，共 **83 个用例**（主任务 62 + 「继续」轮 11 + Windows 发布前收尾 10），覆盖首次读/重复读/外部改/删除/重建/截断/Shadow 丢失与同行数篡改/编码（BOM·GBK·UTF-16·CRLF·LF·末尾换行·空文件）/二进制拒绝/硬链接/符号链接/8 MB 上限/多进程并发 edit 不丢改动/坏 JSON 自愈/缓存目录不可访问/spill 撞名/跨会话凭证伪造/--min-score 有限性/stdin 非法字节/剪枝可观测，以及 **Windows 专属**的真实独占句柄占用 / 只读属性 / `os.replace` 替换失败 6 次重试 / 持锁进程崩溃不留死锁 / 多进程并发读写 / 缓存 JSON 损坏自愈 / Shadow 丢失与损坏降级。运行 `python -m pytest tests/ -q`。**实跑结果：83 passed**，在 **Windows 10 Pro（NT 10.0.26300）** 上分别用 **Python 3.13.13 / pytest 9.2.0** 与 **Python 3.8.20 / pytest 8.3.4** 双版本各跑一遍、两套全绿。本版只针对 Windows，非 Windows 平台不在范围内。
+
+### 已知限制（本轮未解决，诚实留在账上）
+
+- 会话凭证仍是明文环境变量 `DSH_SESSION_ID`、写进 JSON 只比字符串相等；**上下文被压缩但 `DSH_SESSION_ID` 不变时凭证不会自动作废**。这是宿主层信息，本工具无法单方面解决，README/SKILL 已如实说明「同一个会话内有效」。
+- 文件重命名后，旧路径 key 的 `.json` + `.shadow` 会成为孤儿；`hot` 只统计「没有对应 .json 的孤儿影子」，两个文件都在时不报。
+- `edit` 未找到/不唯一返回 rc=3，而 README 早期只写了「0 成功 / 2 失败」（README 已补「0/2/3/130」）。
+- `iter_files` 的静默剪枝、`--min-score nan/inf`、stdin 非法字节替换已在「继续」轮修复（见上）。
+- 临时文件清理仍以「超过 1 小时」为阈值。
+- 项目定位为**仅 Windows 10/11**，Linux / macOS / 跨平台支持不在范围内（范围界定，非缺陷）。
+- 以上均不破坏「宁可少缓存一次」的核心承诺，留待后续版本处理。
+
 ## 1.0.9 — 2026-11-04
 
 这一版是被**外部评审推翻**之后重写的。1.0.8 之前我自己写的测试一直是全绿的，因为测试和实现出自同一个脑子、共享同一个盲点。这次找了 5 个独立上下文的评审员分头攻击（源码逻辑 / 编码字节层 / 缓存账本 / 黑盒破坏 / 鲁棒性），结果每一条都能实测复现。结论是：**1.0.8 不能用在真项目上。**

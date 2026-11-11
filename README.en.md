@@ -37,6 +37,7 @@ What you save is **context (tokens)**. What it costs is a little disk.
 dsh plugin --profile web add Zzzk187/dsh-file-state-cache
 ```
 
+- **Runtime: Windows 10 / 11 only.** This project targets Windows exclusively; Linux / macOS / cross-platform support is out of scope.
 - Requires **Python 3.8+**. No third-party packages — standard library only.
 - The skill appears in your catalog as `file-state-cache`.
 - From a local checkout: `dsh plugin --profile web add /path/to/dsh-file-state-cache`
@@ -74,7 +75,7 @@ F="<package-root>/scripts/fstate"        # the skill tells you where it lives
 
 > Two things that trip up newcomers:
 > - **At most 400 lines per read.** A bigger file gets cut, and it says so — "已显示前 400/1000 行，**不算读过**" plus the command to continue. The next `read` hands you more; it will not fob you off with "unchanged".
-> - The summary only holds **inside the current session**. A new session, or a compacted context, gets the body again. That is deliberate: saving context must not turn into "making you think you already saw it".
+> - The summary only holds **within the same `DSH_SESSION_ID`**. A changed session ID gets the body again; but if the host compacts the context **without** changing that environment variable, the receipt does **not** auto-expire (the tool cannot observe a context compaction). When unsure, run `reset`. That is deliberate: saving context must not turn into "making you think you already saw it".
 
 An `edit` looks like this — **that diff is the verification, no re-read needed**:
 
@@ -134,7 +135,7 @@ read(FILE)
 
 That last branch is the point: **it will not pretend to know what changed.**
 
-> **A deliberate limit**: the "I already delivered this body" receipt is valid **only within the current session**. After a session change or a context compaction, `read` hands you the body again instead of dismissing you with "unchanged". A tool that saves context must never manufacture the illusion of having seen something.
+> **A deliberate limit**: the "I already delivered this body" receipt is valid **only within the same `DSH_SESSION_ID`**, and is issued **only when a full body was actually delivered** — partial reads, truncated reads, and diff views never earn it. A changed session ID makes `read` hand you the body again instead of dismissing you with "unchanged". **Caveat**: if the host compacts context but keeps the same env var, the tool cannot tell and the receipt stays valid — `reset` is the escape hatch. A tool that saves context must never manufacture the illusion of having seen something.
 
 ---
 
@@ -188,11 +189,23 @@ About 300 bytes of JSON per file plus a shadow copy (≤2 MB, only for files you
 | `ERROR: 未找到 old 片段` | `--old` doesn't match the file (spaces / indentation) | print the lines with `read --mode range` and **copy them verbatim** into `--old`; newlines need no massaging |
 | `old 片段出现 N 次，不唯一` | the fragment is too short and matches several places | add a line of context, or `--all` if you really mean all of them |
 | `ERROR: 无法按文本读取（toolarge）` | file is over 8 MB | use the native tools, or split it first |
-| `ERROR: 无法按文本读取（binary）` | contains NUL bytes | this skill does not touch binaries |
+| `ERROR: 无法按文本读取（binary）` | contains NUL bytes, or too many control characters | this skill does not touch binaries (incl. non-text byte streams other than valid UTF-16/32 BOM files) |
 | edit succeeded but the next read says "changed" | your editor changed the file behind your back (formatter, save hook) | `state` shows SHA-1 and version — find out who wrote it |
 | the skill isn't in the catalog | plugin didn't install, or DSH wasn't restarted | `dsh plugin --profile web list`; restart once |
 
-> The skill's own messages are in Chinese, but the `ERROR:` prefix and exit codes (0 success / 2 failure) are stable, so scripts can match on those.
+> The skill's own messages are in Chinese, but the `ERROR:` prefix and exit codes are stable, so scripts can match on them: **0** success, **2** failure, **3** `edit` fragment not found / not unique, **130** interrupted (Ctrl-C).
+
+---
+
+## Regression tests (reproducible)
+
+Since 1.1.0 the tests ship with the repo and can be re-run — no more one-off scripts that readers cannot verify.
+
+```bash
+python -m pytest tests/ -q
+```
+
+Requires Python 3.8+ and pytest (**test-time only; the runtime still has zero third-party dependencies**). 83 cases cover cache hits / external edits / delete+recreate / truncated reads / cross-session receipts / shadow loss & tampering, BOM·GBK·UTF-16·CRLF·newline·empty-file fidelity, binary & 8 MB rejection, hardlinks/symlinks, multi-process concurrent edits without lost updates, corrupted-JSON self-healing, unwritable cache dir, spill filename collisions, `--min-score` finiteness, illegal-stdin-byte rejection, observable scan pruning, plus **Windows-specific** real exclusive-handle locking / read-only attribute / `os.replace` failure / crash-while-holding-lock leaves no deadlock / concurrent multi-process IO / corrupted cache JSON / shadow loss & corruption. Verified on **Windows 10 Pro (NT 10.0.26300)** with both **Python 3.13.13 / pytest 9.2.0** and **Python 3.8.20 / pytest 8.3.4** via `python -m pytest tests/ -q`: **83 passed** on both. This project targets Windows 10/11 only; **Linux / macOS / cross-platform support and verification are out of scope** (a scope boundary, not an unverified item).
 
 ---
 

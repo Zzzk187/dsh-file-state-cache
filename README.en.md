@@ -58,6 +58,8 @@ F="<package-root>/scripts/fstate"        # the skill tells you where it lives
 
 (On Windows: `C:\Users\you\.dsh\profiles\<profile>\node_modules\dsh-file-state-cache`. If unsure, you have the right one when `python "<package-root>/scripts/fstate.py" -h` runs.)
 
+> **Need a whole large file?** `read` is capped by auto's 400 lines *and* `--max-chars 20000`; when it cuts, it says so ("not counted as read"). To actually hand the full body to the Agent, use `read FILE --mode full --max-chars <big enough>` — don't let the default truncation masquerade as a token saving.
+
 ```bash
 "$F" explore "handleRequest" --root .    # when you don't know where the code is
 "$F" read src/app.py                     # 1st time: full text. 2nd: one line.
@@ -115,6 +117,7 @@ An `edit` looks like this — **that diff is the verification, no re-read needed
 - `--max-chars 20000` — output cap; when it cuts, **it always tells you**
 - `--label "config parser"` — show that name instead of the long path
 - `write --mkdir` — create missing parent directories (off by default, so a typo'd path fails loudly instead of silently creating a tree)
+- `--brief` on `explore` / `digest` (since 1.1.1): keep only file + hit lines + the next command; drops the directory/extension overview, signatures, snippets, the edit suggestion and repeated per-file "signatures truncated" notes. **Locators and every ⚠ warning are kept**, what was cut is stated, and without the switch the output is byte-for-byte identical
 
 ---
 
@@ -149,15 +152,30 @@ That last branch is the point: **it will not pretend to know what changed.**
 
 ---
 
-## When NOT to use it
+## When to use it / when NOT to
 
-- **You already know the exact line numbers** → the native read tool is faster; caching is overhead.
-- **One-shot work** (a single command, a script that runs once) → nothing happens twice, so a cache earns nothing.
-- **Binary / images / files over 8 MB** → refused by design.
+1.1.1 ships a reproducible benchmark (`perf-eval/`): A = native Windows reads, B = this tool, small / medium / large files, warmup + 5 repeats, median, real BPE token counts. One-line verdict: **it saves context (tokens), not time** — a cached hit still starts a fresh process, B ≈ 100~110ms per call vs A ≈ 55~62ms. So there is only one question: *will this happen a second time?*
 
-To be honest: **for a single-pass flow ("locate → read a chunk → edit one place → confirm"), this skill actually costs more** (measured 16.5% worse, because `explore` is pricier than a precise grep and `read` adds a line-number prefix).
+**Worth it (the same content is reused):**
 
-It pays off when **the same content gets reused**: touching a file 4 times saves 65%, editing N places with one confirmation each saves 88%, understanding 20 files at once saves 80%.
+| Case | Measured token saving |
+|---|---|
+| Same session, re-reading a medium/large file 5 times | ~75~79% |
+| Same session, re-reading a medium/large file 10 times | ~84~89% |
+| Large/medium `edit` verified by diff (no full re-read) | ~46~49% |
+| External change where a diff alone is acceptable | ~46~49% |
+| `explore` then repeated `read` in one session (≥5) | ~60~72% |
+
+**Not worth it (no saving, or worse):**
+
+- **First read**: ~0% token difference, 81~100% slower.
+- **Cross-session / changed `DSH_SESSION_ID`**: receipt void, body re-delivered, ~0% token difference and 95~113% slower.
+- **Forcing the full post-change body**: ~0% token difference.
+- **Small files**: even 10 reads save only ~28%, `edit` ~6%, and a one-shot `explore`+`read` costs ~68% *more* tokens.
+- **Large/medium `digest`**: default prints several signatures + repeated notes per file — ~109~114% *more* tokens than native (a small directory saves ~18%); `--brief` narrows this to −3~−15%.
+- **Exact line numbers known / one-shot scripts / binaries / >8 MB**: caching is overhead, or refused by design.
+
+> These numbers use the `cl100k_base` real BPE encoder and are **not the target model's billing vocabulary**; the target model's absolute billed tokens and a real end-to-end Agent run (with inference) were not measured. See `perf-eval/REPORT.md`.
 
 ---
 
@@ -199,13 +217,13 @@ About 300 bytes of JSON per file plus a shadow copy (≤2 MB, only for files you
 
 ## Regression tests (reproducible)
 
-Since 1.1.0 the tests ship with the repo and can be re-run — no more one-off scripts that readers cannot verify.
+Since 1.1.0 the tests ship with the repo and can be re-run — no more one-off scripts that readers cannot verify. 1.1.1 adds `tests/test_brief_output.py` (11 cases) covering `--brief` default-output identity, retained locators and every ⚠, no read receipt created, and no redundant note on small directories.
 
 ```bash
 python -m pytest tests/ -q
 ```
 
-Requires Python 3.8+ and pytest (**test-time only; the runtime still has zero third-party dependencies**). 83 cases cover cache hits / external edits / delete+recreate / truncated reads / cross-session receipts / shadow loss & tampering, BOM·GBK·UTF-16·CRLF·newline·empty-file fidelity, binary & 8 MB rejection, hardlinks/symlinks, multi-process concurrent edits without lost updates, corrupted-JSON self-healing, unwritable cache dir, spill filename collisions, `--min-score` finiteness, illegal-stdin-byte rejection, observable scan pruning, plus **Windows-specific** real exclusive-handle locking / read-only attribute / `os.replace` failure / crash-while-holding-lock leaves no deadlock / concurrent multi-process IO / corrupted cache JSON / shadow loss & corruption. Verified on **Windows 10 Pro (NT 10.0.26300)** with both **Python 3.13.13 / pytest 9.2.0** and **Python 3.8.20 / pytest 8.3.4** via `python -m pytest tests/ -q`: **83 passed** on both. This project targets Windows 10/11 only; **Linux / macOS / cross-platform support and verification are out of scope** (a scope boundary, not an unverified item).
+Requires Python 3.8+ and pytest (**test-time only; the runtime still has zero third-party dependencies**). 94 cases cover cache hits / external edits / delete+recreate / truncated reads / cross-session receipts / shadow loss & tampering, BOM·GBK·UTF-16·CRLF·newline·empty-file fidelity, binary & 8 MB rejection, hardlinks/symlinks, multi-process concurrent edits without lost updates, corrupted-JSON self-healing, unwritable cache dir, spill filename collisions, `--min-score` finiteness, illegal-stdin-byte rejection, observable scan pruning, `--brief` default-compat & receipt guard, plus **Windows-specific** real exclusive-handle locking / read-only attribute / `os.replace` failure / crash-while-holding-lock leaves no deadlock / concurrent multi-process IO / corrupted cache JSON / shadow loss & corruption. Verified on **Windows 10 Pro (NT 10.0.26300)** with both **Python 3.13.13 / pytest 9.2.0** and **Python 3.8.20 / pytest 8.3.4** via `python -m pytest tests/ -q`: **94 passed** on both. This project targets Windows 10/11 only; **Linux / macOS / cross-platform support and verification are out of scope** (a scope boundary, not an unverified item).
 
 ---
 

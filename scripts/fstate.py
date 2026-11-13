@@ -1890,6 +1890,11 @@ def cmd_digest(args: argparse.Namespace) -> int:
         more = f" 等 {len(skipped)} 个" if len(skipped) > 6 else ""
         print(f"# 跳过 {len(skipped)} 个非源码后缀文件（{names}{more}）—— 要一起看就加 --all-ext")
         print("#   （默认只摘要源码后缀；被跳过不等于目录里没有）")
+    brief = bool(getattr(args, "brief", False))
+    # 说明行只在「真的省略了内容」时才打印：小目录里每文件本来就只有 1 条签名，
+    # 固定加一行说明反而是纯噪音（perf-eval/brief_recheck.txt 实测倒退 27.9pp）。
+    # 没砍东西时 --brief 与默认档逐字一致，不产生任何额外开销。
+    trimmed = False
     for p in uniq:
         text, enc = read_text(p)
         meta = _load_meta(p)
@@ -1924,14 +1929,25 @@ def cmd_digest(args: argparse.Namespace) -> int:
                     break
                 sigs.append(f"{i:5d}| {ln.strip()[:140]}")
         if sigs:
-            print("\n".join("  " + x for x in sigs))
-            if truncated:
+            shown = sigs[:1] if brief else sigs
+            # 只省下 1 条签名时不必专门声明 —— 那行中文说明本身比省掉的签名还贵
+            # （perf-eval/brief_recheck.txt 里 small 目录实测倒退）。省略 ≥2 条、
+            # 或发生了「签名未列完」截断，才算真的精简了，末尾才补那行说明。
+            if brief and (len(sigs) > len(shown) + 1 or truncated):
+                trimmed = True
+            print("\n".join("  " + x for x in shown))
+            if truncated and not brief:
                 print(f"  ... 签名未列完（--max-sigs {args.max_sigs}），看局部用 read --mode range")
         else:
             head = "\n".join(
                 f"{i:5d}| {lines[i-1][:120]}" for i in range(1, min(len(lines), 5) + 1)
             )
             print("  " + head.replace("\n", "\n  "))
+    # 放在末尾：是否真的省略了内容，只有跑完文件循环才知道。
+    # 没砍东西就一行都不加（--brief 与默认档逐字一致）。
+    if brief and trimmed:
+        print("# 以上为精简档（--brief）：每文件只留首条签名，"
+              "已省略逐文件的「签名未列完」等提示；要完整摘要去掉 --brief。")
     return 0
 
 
@@ -2322,7 +2338,12 @@ def cmd_explore(args: argparse.Namespace) -> int:
         print(f"  ⚠ 跳过 {len(unreadable)} 个读不了的文件: {names}{more}")
     # 概览压成两行：目录/后缀只在「一眼看结构」时有用，不值得占几十行。
     # 已有唯一强定义时（答案没悬念）这两行纯属噪音。
-    if not strong:
+    # --brief：连概览也省掉，换成一行「砍了什么」的声明（诚实性护栏）。
+    brief = bool(getattr(args, "brief", False))
+    if brief:
+        print("  # 精简档（--brief）：省略目录/后缀概览、签名、片段、edit 建议；"
+              "命中行、下一步 read 与全部 ⚠ 保留。要完整输出去掉 --brief。")
+    elif not strong:
         dirs = " | ".join(f"{d} {c}" for d, c in sorted(dir_count.items(), key=lambda x: -x[1])[:6])
         exts = " ".join(f"{e}:{c}" for e, c in sorted(ext_count.items(), key=lambda x: -x[1])[:8])
         print(f"  目录: {dirs}")
@@ -2336,10 +2357,10 @@ def cmd_explore(args: argparse.Namespace) -> int:
             for ln in h["lines"]:
                 print("  命中 " + ln.strip())
         # 签名与片段只给第一个文件：第一名是答案的概率最高，其余给了也是噪音
-        if h["sigs"] and not strong and (idx == 0 or len(top) <= 2):
+        if not brief and h["sigs"] and not strong and (idx == 0 or len(top) <= 2):
             for s in h["sigs"][:3]:
                 print("  签名 " + s.strip())
-        if h["snip"] and idx == 0:
+        if not brief and h["snip"] and idx == 0:
             for ln in h["snip"].splitlines()[: args.snippet_lines]:
                 print("  片段 " + ln.strip())
     # 被截断的文件只列路径：一行几十字节，换来「没有东西被藏起来」
@@ -2370,7 +2391,8 @@ def cmd_explore(args: argparse.Namespace) -> int:
         if end < start:
             end = start
         print(f"下一步: fstate.py read \"{h0['abs']}\" --mode range --start {start} --end {end}")
-        print(f"        fstate.py edit \"{h0['abs']}\" --old ... --new ...   （回 diff，不必重读全文）")
+        if not brief:
+            print(f"        fstate.py edit \"{h0['abs']}\" --old ... --new ...   （回 diff，不必重读全文）")
     else:
         print("无命中。换个说法（更短的词）、或加大 --max-scan / 换 --root。")
     return 0
@@ -2399,6 +2421,8 @@ def main() -> int:
     e.add_argument("--max-scan", type=_positive_int, default=6000, help="最多扫描多少个文件（默认 6000，超了会明说截断）")
     e.add_argument("--min-score", type=_finite_float, default=3.0, help="低于这个分数的命中不列（默认 3.0；nan/inf 会被拒）")
     e.add_argument("--max-chars", type=_positive_int, default=24000, help="输出字符上限，超了落盘并只给预览（默认 24000）")
+    e.add_argument("--brief", action="store_true",
+                   help="精简输出：省略目录/后缀概览、签名、片段、edit 建议（默认关闭；不带时输出与旧版逐字一致）")
     e.set_defaults(fn=cmd_explore)
 
     r = sub.add_parser("read", allow_abbrev=False, help="带缓存的读：未变→摘要；变了→diff；范围→行号区间")
@@ -2464,6 +2488,8 @@ def main() -> int:
     dg.add_argument("--max-sigs", type=_positive_int, default=12, help="每文件列几条签名（默认 12）")
     dg.add_argument("--max-scan", type=_positive_int, default=400, help="目录最多扫描几个文件（默认 400）")
     dg.add_argument("--all-ext", action="store_true", help="连非源码后缀（.md/.txt/无后缀）也摘要")
+    dg.add_argument("--brief", action="store_true",
+                   help="精简输出：每文件只列首条签名、合并重复的提示（默认关闭；不带时输出与旧版逐字一致）")
     dg.set_defaults(fn=cmd_digest)
 
     d = sub.add_parser("diff", allow_abbrev=False, help="回放最近一次 diff（不受上次预览截断影响）")

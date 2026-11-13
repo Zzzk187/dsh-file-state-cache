@@ -1,6 +1,6 @@
 # 开发记录 / 交接手册
 
-> 写于 **2026-11-13**，截至 **v1.1.1 + 文档维护提交 `4445061`**。
+> 写于 **2026-11-13**，截至 **v1.1.1（GitHub Release + npm 首发均已落地）**。
 > 面向：以后大更新时接手的 Agent / 开发者。
 > 目标：**不用翻聊天记录就能安全继续**。本文记录「做了什么、为什么这么做、哪些坑别再踩、下次怎么开工」。
 > 版本逐条历史看 [CHANGELOG.md](CHANGELOG.md)，完整用法与实测数据看 [SKILL.md](SKILL.md)，用户向说明看 [README.md](README.md)。
@@ -10,7 +10,8 @@
 ## 0. 一句话现状
 
 - 功能开发**已收口**，进入「验收 + 常态化维护」。不建后台服务、不建计划任务、不建数据库。
-- 工作树干净；本地 `main` = `origin/main` = `4445061`；`v1.1.0` / `v1.1.1` 两个轻量 tag 与 Release 齐备。
+- 工作树干净；本地 `main` = `origin/main`；`v1.1.0` / `v1.1.1` 两个轻量 tag 与 GitHub Release 齐备。
+- **npm 首发成功**：`dsh-file-state-cache@1.1.1`（public），`dist-tags.latest=1.1.1`，线上 tarball shasum 与本地 `npm pack --dry-run` 逐字一致（第 9 节）。
 - 双版本全量回归 **94 passed**（Python 3.8.20 与 3.13.13，Windows）。
 - **正确性侧已无已知待修 bug**；剩下的都是主动取舍（见第 10 节），不是缺陷。
 
@@ -55,6 +56,7 @@
 | 仓库根 | `C:\Users\xing\Documents\deepseek-harness\default-workspace\dsh-file-state-cache` |
 | 远程 | `https://github.com/Zzzk187/dsh-file-state-cache.git`（branch `main`） |
 | 最新 Release | `https://github.com/Zzzk187/dsh-file-state-cache/releases/tag/v1.1.1`（id `444282778`，draft=false） |
+| npm 包 | `dsh-file-state-cache@1.1.1`，https://www.npmjs.com/package/dsh-file-state-cache （2026-11-13 首发，public，官方 registry） |
 | 实测系统 | Windows 10 Pro，NT `10.0.26300` |
 | 默认 `python` | Python **3.13.13** + pytest **9.2.0** |
 | Py3.8 解释器 | `D:\Software\Dev\Miniforge\envs\fstate_py38\python.exe`（**3.8.20** + pytest **8.3.4**） |
@@ -75,8 +77,10 @@
 | — | （继续轮） | 2026-11-11 | 收掉 3 个残留 bug：`--min-score` nan/inf、stdin 非法字节静默替换、iter_files 静默剪枝；73→83 用例 | m00609「继续啊」。真 Linux 内核本机做不到（无发行版/Docker），如实标「未验证」并改用 POSIX 分支白盒测试固化 |
 | `3cbec4a` | **v1.1.1** | 2026-11-13 | 使用侧优化：文档「值得/不值得」清单 + 大文件全文提示 + `explore/digest --brief` 精简档；发布 Release `444282778` | m01809「还能优化吗」→ 用户选 **"1、2"**（L0 文档 + L1 低风险代码）。性能评估发现 digest 大目录 Token 倒退 +114%，用 opt-in 开关修到 −15% |
 | `4445061` | （docs，无新 tag） | 2026-11-13 | 清 3 个测试缓存目录；README.md / README.en.md 各 236→139 行通俗化；不改版本号 | m02199「清理不要的东西，保持结构的整洁性，同时 README 要简单通俗易懂」。用户确认只清缓存、`perf-eval/` 保留；授权「提交并推送」 |
+| `9790f70` | （docs，无新 tag） | 2026-11-13 | 新增 `DEVLOG.md` 开发记录与交接手册（14 节）；README 中英「更多」节加入口指针；不改版本号、不发 Release | m02285「写个完整的开发记录，以后大更新时再用到你」。纯文档、提交并推送留档 |
+| — | （npm 首发，非 git 提交） | 2026-11-13 | `dsh-file-state-cache@1.1.1` 首次发布到 npm（public）；不改代码 / 版本号 / tag / Release | m02288「怎么发布到 npm」。账号 `zzzk187` 开 2FA `auth-and-writes`，`npm publish` 直跑报 `EOTP`，用户自己终端带 `--otp` 发成功；第 9 节记全渠道与坑 |
 
-**发布方式**（历轮一致）：轻量 tag（与 v1.0.x 一致）+ GitHub API 建 Release；v1.1.0 走 Clash 代理（直连超时），v1.1.1 与 `4445061` **直连成功、未动系统代理**。
+**发布渠道有两条、互相独立**：① GitHub（tag + Release）② npm（`npm publish`）。**发 GitHub ≠ 发 npm**，下次大更新两条都要各发一遍；npm 渠道 2026-11-13 才首次补上，之前各轮只发了 GitHub。GitHub 侧：轻量 tag（与 v1.0.x 一致）+ GitHub API 建 Release；v1.1.0 走 Clash 代理（直连超时），v1.1.1 与 `4445061` **直连成功、未动系统代理**。npm 侧流程与 2FA / staged 坑见第 9 节。
 
 ---
 
@@ -188,6 +192,26 @@ D:\Software\Dev\Miniforge\envs\fstate_py38\python.exe -m pytest tests/ -q
 5. Release：用 `git credential fill` 在**内存**取 GCM `gho_` token（只打印前缀、不打印值），走 GitHub API `POST /repos/Zzzk187/dsh-file-state-cache/releases`，`draft=false`、`target_commitish=main`。本环境未装 `gh`。
 6. 复核：`git rev-parse HEAD` / `origin/main` / `v1.x.x` / Release `target_commitish` **四者 commit 一致**，工作树干净。
 
+### npm 渠道（与 GitHub 独立，别漏发）
+
+`package.json` 已发布就绪：`name=dsh-file-state-cache`、`publishConfig.access=public`、`registry=https://registry.npmjs.org/`、`files` 白名单 10 项（`lib/` `scripts/` `SKILL.md` `README.md` `README.en.md` `CHANGELOG.md` `cordis.patch.yml` `LICENSE`）。**发 npm 不改变 DSH 安装方式**（仍是 `dsh plugin --profile web add Zzzk187/dsh-file-state-cache` 走 GitHub 源）；`files` 不含 `DEVLOG.md` / `tests/`，npmjs 渲染 README 时相对链接指回 GitHub 不会坏。
+
+1. 登录：`npm login`，`npm whoami` 应回 `zzzk187`。
+2. 干跑：`npm publish --dry-run`（等价 `npm pack --dry-run`），确认 10 文件 / 96.2 kB / shasum。
+3. **版本号不可复用**：先 `npm version patch|minor|major` 再发；已发过的版本改不动，只能发新版本。
+4. 发布：本账号 `zzzk187` 开 **2FA `auth-and-writes`**（写操作也要二次验证），`npm publish` 直跑会 `npm error code EOTP` / HTTP 401 `OTP required for authentication`。带一次性密码 `npm publish --otp=123456`（码约 30 秒过期），或点开 npm 12 给的浏览器授权链接认证后重跑。**OTP 是用户私有的，Agent 不代收、不代填**；长期免 OTP 可用 granular automation token（bypass 2FA）写进 `~/.npmrc`。
+5. 复核（**一律带 `--prefer-online` 绕过缓存**）：
+   - `npm view dsh-file-state-cache version` 与 `dist-tags.latest` → 新版本号；
+   - `npm pack dsh-file-state-cache@X.Y.Z --dry-run` 能列出 10 文件；
+   - 线上 `dist.shasum` 与发布前本地 `npm pack --dry-run` 的 shasum **逐字一致**（最强证据：线上就是这份代码，没被换过）；
+   - 直连 `https://registry.npmjs.org/dsh-file-state-cache/-/dsh-file-state-cache-X.Y.Z.tgz` 带 cache-buster → HTTP 200；
+   - `git status --short` 干净、无 `.tgz` 残留、GitHub Release 与 npm 版本号一致。
+6. 网页：https://www.npmjs.com/package/dsh-file-state-cache 。
+
+**npm 12 分段发布中间态**（2026-11-13 首发实测）：`npm publish` 先建 `0.0.0-stage` 占位 stub（`description: "Temporary package placeholder for staged publishing"`、`stub: true`、2 文件 / 342 字节），约 98 秒后才 final 出真版本。这期间不带 `--prefer-online` 的 `npm view ... version` 可能回 `0.0.0-stage`、`@1.1.1` 回 `E404 No match found`，是 **CDN / 本地缓存的旧快照**，不代表发布失败。`0.0.0-stage` 会留在 `versions` 列表里、无害；只要 `dist-tags.latest` 指向真版本，`npm install dsh-file-state-cache` 拿到的就是 1.1.1，不用清理。判定成功要看「latest + shasum 一致 + tarball HTTP 200」三者，别只凭一次 `npm view version` 下结论。
+
+**首发实测锚点（1.1.1，用于事后核对传上去的到底是哪份代码）**：线上 `dist.shasum` = `4ea153bd56f3e747fa60135f3b8fcf8a2f75ae16`，与发布前本地 `npm pack --dry-run` 完全相同；`dist.integrity` = `sha512-D8bZqydG1XEBg[...]X3F3b/vR3PQzA==`；包内 10 文件 / 96.2 kB / 解包 245.0 kB。`0.0.0-stage` 创建于 `2026-11-13T14:54:17.741Z`，真版本 `1.1.1` final 于 `2026-11-13T14:55:55.308Z`（约 98 秒中间态）。
+
 **坑**：PowerShell `git show HEAD:scripts/fstate.py | Out-File -Encoding utf8` 会**破坏字节**（中文被重编码 / 加 BOM，129629 → 132156）。导出旧版源码必须用 Python `subprocess.run([...], capture_output=True).stdout` → `Path.write_bytes(blob)` 原样落盘。
 
 ---
@@ -243,6 +267,8 @@ D:\Software\Dev\Miniforge\envs\fstate_py38\python.exe -m pytest tests/ -q
 - **默认输出逐字不变**是所有 CLI 兼容对比的前提，任何新行为都必须做成默认关闭的可选开关。
 - 性能评估别靠减少必要信息制造 Token 节省：B 侧凡要交付整篇一律显式放大 `--max-chars`，并设跨会话 / 强制全文两组护栏。
 - 控制台中文乱码只是显示问题（`chcp 65001` + `python -X utf8`），不影响 JSON 数据；别因此误判结果。
+- `npm publish` 要过 **2FA `auth-and-writes`**（`EOTP` / HTTP 401），必须 `--otp=xxxxxx` 或走 npm 12 浏览器授权链接；OTP 用户私有，Agent 不代收、不代填。
+- npm 12 **staged publishing 中间态**：publish 先建 `0.0.0-stage` 占位、稍后才 final 真版本；这期间不带 `--prefer-online` 的 `npm view` 命中旧快照会误判成「没发上去 / 404」。判定成功看 `dist-tags.latest` + 线上/本地 shasum 一致 + tarball HTTP 200，别只看一次 `npm view version`。
 
 ---
 
@@ -258,6 +284,7 @@ D:\Software\Dev\Miniforge\envs\fstate_py38\python.exe -m pytest tests/ -q
 | 测试 | [tests/](tests/) |
 | 性能报告（**仓库外**） | `..\perf-eval\REPORT.md` |
 | 远程 / Release | https://github.com/Zzzk187/dsh-file-state-cache · https://github.com/Zzzk187/dsh-file-state-cache/releases/tag/v1.1.1 |
+| npm 包 | https://www.npmjs.com/package/dsh-file-state-cache （`npm view dsh-file-state-cache version --prefer-online`） |
 
 ---
 

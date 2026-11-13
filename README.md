@@ -134,6 +134,7 @@ python -m pytest tests/ -q
 
 - 完整用法、什么时候值得用（实测数据）、踩坑清单：[SKILL.md](SKILL.md)
 - 版本历史、性能复测数字、已知限制：[CHANGELOG.md](CHANGELOG.md)
+- 给以后接手的开发者：开发记录与交接手册 [DEVLOG.md](DEVLOG.md)
 - 在 DSH `0.2.1-rc.5` 上验证通过
 
 MIT 许可 · 见 [LICENSE](LICENSE)

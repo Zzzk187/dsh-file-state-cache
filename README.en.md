@@ -134,6 +134,7 @@ python -m pytest tests/ -q
 
 - Full usage, when it's worth it (measured numbers), and the gotcha list: [SKILL.md](SKILL.md)
 - Version history, benchmark numbers, known limits: [CHANGELOG.md](CHANGELOG.md)
+- For a future maintainer: development record & handoff [DEVLOG.md](DEVLOG.md)
 - Verified against DSH `0.2.1-rc.5`
 
 MIT · see [LICENSE](LICENSE)
